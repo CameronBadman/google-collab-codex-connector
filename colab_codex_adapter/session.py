@@ -16,6 +16,10 @@ from mcp.types import CallToolResult, Tool
 
 from .bridge import ColabWebSocketServer
 
+REMOTE_INIT_TIMEOUT_SECONDS = 5.0
+REMOTE_TOOL_LIST_TIMEOUT_SECONDS = 5.0
+REMOTE_TOOL_CALL_TIMEOUT_SECONDS = 300.0
+
 
 class ColabTransport(ClientTransport):
     def __init__(self, bridge: ColabWebSocketServer):
@@ -38,6 +42,9 @@ class ColabTransport(ClientTransport):
 class ConnectionStatus:
     connected: bool
     connecting: bool
+    server_listening: bool
+    browser_ws_connected: bool
+    remote_mcp_initialized: bool
     url: str
     port: int
     remote_tool_count: int | None = None
@@ -54,6 +61,7 @@ class ColabSessionManager:
         self._bridge: ColabWebSocketServer | None = None
         self._client: Client | None = None
         self._connect_task: asyncio.Task[None] | None = None
+        self._remote_tools: list[Tool] | None = None
         self._last_error: str | None = None
         self._lock = asyncio.Lock()
 
@@ -73,6 +81,7 @@ class ColabSessionManager:
         self._bridge = None
         self._client = None
         self._connect_task = None
+        self._remote_tools = None
 
     @property
     def bridge(self) -> ColabWebSocketServer:
@@ -85,7 +94,11 @@ class ColabSessionManager:
             self._bridge is not None
             and self._bridge.connection_live.is_set()
             and self._client is not None
+            and self._remote_tools is not None
         )
+
+    def browser_ws_connected(self) -> bool:
+        return self._bridge is not None and self._bridge.connection_live.is_set()
 
     def _is_connecting(self) -> bool:
         return self._connect_task is not None and not self._connect_task.done()
@@ -93,6 +106,8 @@ class ColabSessionManager:
     def _start_connect_task(self) -> None:
         if self._is_connecting():
             return
+        self._client = None
+        self._remote_tools = None
         self._connect_task = asyncio.create_task(self._connect_client())
 
     async def _connect_client(self) -> None:
@@ -100,14 +115,30 @@ class ColabSessionManager:
             return
         try:
             await self._bridge.connection_live.wait()
-            self._client = await self._exit_stack.enter_async_context(
-                Client(ColabTransport(self._bridge), init_timeout=None)
+            client = await asyncio.wait_for(
+                self._exit_stack.enter_async_context(
+                    Client(
+                        ColabTransport(self._bridge),
+                        init_timeout=REMOTE_INIT_TIMEOUT_SECONDS,
+                    )
+                ),
+                timeout=REMOTE_INIT_TIMEOUT_SECONDS,
             )
+            tools = await asyncio.wait_for(
+                client.list_tools(), timeout=REMOTE_TOOL_LIST_TIMEOUT_SECONDS
+            )
+            self._client = client
+            self._remote_tools = tools
             self._last_error = None
+        except asyncio.TimeoutError:
+            self._client = None
+            self._remote_tools = None
+            self._last_error = "Timed out initializing Colab frontend MCP session"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._client = None
+            self._remote_tools = None
             self._last_error = f"{type(exc).__name__}: {exc}"
             logging.exception("Failed to initialize Colab frontend MCP client")
 
@@ -136,15 +167,22 @@ class ColabSessionManager:
 
     async def status(self, include_remote_tools: bool = False) -> ConnectionStatus:
         await self.start()
-        remote_tool_count: int | None = None
+        remote_tool_count = len(self._remote_tools) if self._remote_tools else None
         if include_remote_tools and self.is_connected():
             try:
-                remote_tool_count = len(await self.list_tools())
+                remote_tool_count = len(
+                    await self.list_tools(timeout=REMOTE_TOOL_LIST_TIMEOUT_SECONDS)
+                )
+            except asyncio.TimeoutError:
+                self._last_error = "Timed out listing Colab frontend tools"
             except Exception as exc:
                 self._last_error = f"{type(exc).__name__}: {exc}"
         return ConnectionStatus(
             connected=self.is_connected(),
             connecting=self._is_connecting(),
+            server_listening=self._bridge is not None and self.bridge.port != 0,
+            browser_ws_connected=self.browser_ws_connected(),
+            remote_mcp_initialized=self.is_connected(),
             url=self.bridge.browser_url,
             port=self.bridge.port,
             remote_tool_count=remote_tool_count,
@@ -159,10 +197,20 @@ class ColabSessionManager:
             )
         return self._client
 
-    async def list_tools(self) -> list[Tool]:
-        return await self.require_client().list_tools()
+    async def list_tools(
+        self, timeout: float = REMOTE_TOOL_LIST_TIMEOUT_SECONDS
+    ) -> list[Tool]:
+        tools = await asyncio.wait_for(self.require_client().list_tools(), timeout)
+        self._remote_tools = tools
+        return tools
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any] | None = None
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        timeout: float = REMOTE_TOOL_CALL_TIMEOUT_SECONDS,
     ) -> CallToolResult:
-        return await self.require_client().call_tool(name, arguments or {})
+        return await asyncio.wait_for(
+            self.require_client().call_tool(name, arguments or {}, timeout=timeout),
+            timeout,
+        )

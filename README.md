@@ -101,6 +101,19 @@ After Codex starts with the adapter configured:
 4. Call `colab_status` again and confirm `connected` is `true`.
 5. Use the notebook tools.
 
+`colab_status` reports the connection phases separately:
+
+- `server_listening`: the local websocket server is bound to a port.
+- `browser_ws_connected`: the Colab browser tab opened the websocket.
+- `remote_mcp_initialized`: the browser-side MCP session completed startup and
+  tool discovery.
+- `remote_tool_count`: cached count of discovered Colab frontend tools.
+
+Notebook tools should only be used after `remote_mcp_initialized` is `true`.
+Status calls are intentionally non-blocking around remote tool discovery; if the
+browser connects but remote MCP startup stalls, status returns the partial state
+instead of hanging.
+
 Primary tools:
 
 - `colab_connect`
