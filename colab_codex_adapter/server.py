@@ -120,7 +120,7 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
         """Execute an existing Colab notebook cell."""
         return await call_resolved_tool(
             session,
-            ["execute_cell", "run_cell", "run_selected_cell"],
+            ["run_code_cell", "execute_cell", "run_cell", "run_selected_cell"],
             {"cell_id": cell_id, "cell_index": cell_index},
             remote_tool_name,
         )
@@ -133,6 +133,7 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
         return await call_resolved_tool(
             session,
             [
+                "run_code_cell",
                 "execute_code",
                 "run_code",
                 "execute_python",
@@ -151,7 +152,15 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
         package_value = packages if isinstance(packages, list) else [packages]
         return await call_resolved_tool(
             session,
-            ["install_package", "pip_install", "install_packages", "run_pip"],
+            [
+                "install_package",
+                "pip_install",
+                "install_packages",
+                "run_pip",
+                "run_code_cell",
+                "execute_code",
+                "run_code",
+            ],
             {
                 "packages": package_value,
                 "code": f"%pip install {' '.join(package_value)}",

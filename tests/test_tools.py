@@ -28,6 +28,15 @@ def test_pick_tool_accepts_explicit_remote_name() -> None:
     assert selected.name == "custom"
 
 
+def test_pick_tool_matches_real_colab_run_code_cell_name() -> None:
+    selected = pick_tool(
+        [tool("add_code_cell"), tool("run_code_cell"), tool("update_cell")],
+        None,
+        ["run_code_cell", "execute_code", "run_code"],
+    )
+    assert selected.name == "run_code_cell"
+
+
 def test_pick_tool_reports_available_tools() -> None:
     with pytest.raises(ValueError, match="Available remote tools: custom"):
         pick_tool([tool("custom")], None, ["execute_code"])
