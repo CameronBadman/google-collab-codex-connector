@@ -17,6 +17,11 @@ async def test_static_tool_list_is_available_without_colab_browser() -> None:
         "colab_list_remote_tools",
         "colab_call_remote_tool",
         "colab_run_python",
+        "colab_run_python_async",
+        "colab_job_status",
+        "colab_wait_job",
+        "colab_run_python_wait",
+        "colab_list_jobs",
     }.issubset(names)
 
 

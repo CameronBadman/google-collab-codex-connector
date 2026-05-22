@@ -9,6 +9,7 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
+from .jobs import ColabJobManager, result_data
 from .session import ColabSessionManager, NotConnectedError
 from .tools import (
     call_resolved_tool,
@@ -19,14 +20,7 @@ from .tools import (
 
 
 def _result_data(result: Any) -> dict[str, Any]:
-    data = getattr(result, "structured_content", None)
-    if isinstance(data, dict):
-        return data
-    data = getattr(result, "data", None)
-    if isinstance(data, dict):
-        return data
-    data = first_json_object(result)
-    return data if isinstance(data, dict) else {}
+    return result_data(result)
 
 
 async def _remote_tool_names(session: ColabSessionManager) -> set[str]:
@@ -75,6 +69,7 @@ async def _append_and_run_code(
 
 def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
     session = manager or ColabSessionManager()
+    jobs = ColabJobManager(session)
     mcp = FastMCP(
         name="ColabCodexAdapter",
         instructions=(
@@ -288,6 +283,35 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
             {"code": code},
             remote_tool_name,
         )
+
+    @mcp.tool()
+    async def colab_run_python_async(code: str) -> dict[str, Any]:
+        """Start a tracked Python cell job and return its job id."""
+        return await jobs.start_python(code)
+
+    @mcp.tool()
+    async def colab_job_status(job_id: str) -> dict[str, Any]:
+        """Return the current state and outputs for a tracked Colab job."""
+        return await jobs.status(job_id)
+
+    @mcp.tool()
+    async def colab_wait_job(
+        job_id: str, timeout_seconds: float = 300.0
+    ) -> dict[str, Any]:
+        """Wait until a tracked Colab job finishes or the timeout expires."""
+        return await jobs.wait(job_id, timeout_seconds)
+
+    @mcp.tool()
+    async def colab_run_python_wait(
+        code: str, timeout_seconds: float = 300.0
+    ) -> dict[str, Any]:
+        """Run Python in a tracked cell job and wait for its outputs."""
+        return await jobs.run_python_wait(code, timeout_seconds)
+
+    @mcp.tool()
+    async def colab_list_jobs() -> dict[str, Any]:
+        """List tracked Colab jobs for this adapter process."""
+        return {"jobs": jobs.list_jobs()}
 
     @mcp.tool()
     async def colab_install_package(

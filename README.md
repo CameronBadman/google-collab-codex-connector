@@ -19,6 +19,7 @@ flow, while exposing stable `colab_*` tools that Codex can see immediately.
 - Update cells.
 - Run existing code cells.
 - Run arbitrary Python by adding a code cell and executing it.
+- Track Python cell executions as adapter-local jobs.
 - Install packages by adding and running a `%pip install ...` cell.
 - Fall back to raw remote tool calls when Colab changes its frontend tool names.
 
@@ -124,6 +125,11 @@ Primary tools:
 - `colab_update_cell`
 - `colab_run_cell`
 - `colab_run_python`
+- `colab_run_python_async`
+- `colab_job_status`
+- `colab_wait_job`
+- `colab_run_python_wait`
+- `colab_list_jobs`
 - `colab_install_package`
 
 Diagnostic escape hatch:
@@ -133,6 +139,28 @@ Diagnostic escape hatch:
 If a wrapper does not match Colab's current frontend schema, call
 `colab_list_remote_tools` and then use `colab_call_remote_tool` with the exact
 remote tool name and arguments.
+
+## Tracked Jobs
+
+The adapter can track Colab cell executions as in-memory jobs:
+
+- `colab_run_python_async(code)` starts a tracked Python cell job and returns a
+  `job_id`.
+- `colab_job_status(job_id)` returns the tracked state, outputs, and error.
+- `colab_wait_job(job_id, timeout_seconds=300)` waits until the job finishes or
+  the timeout expires.
+- `colab_run_python_wait(code, timeout_seconds=300)` starts a job and waits for
+  it in one call.
+- `colab_list_jobs()` lists jobs tracked by the current adapter process.
+
+Current Colab exposes `run_code_cell` as the only execute primitive, and that
+remote call returns after execution. Because of that, `colab_run_python_async`
+is best-effort async: it gives a stable job id and status API, but it may still
+wait for Colab's execute call to return before Codex receives the `job_id`.
+If Colab later exposes a non-blocking execute tool, the job manager can use it
+without changing the public Codex-facing API.
+
+Jobs are process-local. Restarting Codex or the MCP server clears the job list.
 
 ## Local Development
 
