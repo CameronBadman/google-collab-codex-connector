@@ -124,3 +124,14 @@ async def test_error_output_marks_job_error() -> None:
 
     assert started["state"] == "error"
     assert started["error"] == "ValueError: bad"
+
+
+async def test_mark_stale_marks_running_jobs_only() -> None:
+    manager = ColabJobManager(FakeSession(run_outputs=[]))  # type: ignore[arg-type]
+    started = await manager.start_python("while True: pass")
+
+    manager.mark_stale("reset")
+
+    status = await manager.status(started["job_id"])
+    assert status["state"] == "stale"
+    assert status["error"] == "reset"

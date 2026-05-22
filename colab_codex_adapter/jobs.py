@@ -169,3 +169,12 @@ class ColabJobManager:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return [job.to_dict() for job in self.jobs.values()]
+
+    def mark_stale(self, reason: str) -> None:
+        now = time.time()
+        for job in self.jobs.values():
+            if job.state in {"finished", "error", "missing", "stale"}:
+                continue
+            job.state = "stale"
+            job.error = reason
+            job.finished_at = now

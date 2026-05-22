@@ -102,6 +102,15 @@ After Codex starts with the adapter configured:
 4. Call `colab_status` again and confirm `connected` is `true`.
 5. Use the notebook tools.
 
+Use `colab_connection_url` when you only need the current URL, port, token
+prefix, connection id, and adapter PID. It never calls the browser-side MCP
+session, so it is safe when Colab is half-connected or stale.
+
+Use `colab_reset_connection` when old Colab tabs, stale ports, or multiple Codex
+sessions make the current connection confusing. It closes the current local
+bridge, creates a fresh token and port, marks running adapter-local jobs as
+`stale`, and returns the new connection status.
+
 `colab_status` reports the connection phases separately:
 
 - `server_listening`: the local websocket server is bound to a port.
@@ -109,6 +118,9 @@ After Codex starts with the adapter configured:
 - `remote_mcp_initialized`: the browser-side MCP session completed startup and
   tool discovery.
 - `remote_tool_count`: cached count of discovered Colab frontend tools.
+- `connection_id`: adapter-local id for the current token/port generation.
+- `adapter_pid`: process id for the Codex MCP server.
+- `token_prefix`: short token prefix for debugging stale Colab tabs.
 
 Notebook tools should only be used after `remote_mcp_initialized` is `true`.
 Status calls are intentionally non-blocking around remote tool discovery; if the
@@ -119,6 +131,8 @@ Primary tools:
 
 - `colab_connect`
 - `colab_status`
+- `colab_connection_url`
+- `colab_reset_connection`
 - `colab_list_remote_tools`
 - `colab_get_notebook`
 - `colab_add_cell`

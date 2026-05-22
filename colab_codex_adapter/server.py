@@ -95,6 +95,22 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
         return status.__dict__
 
     @mcp.tool()
+    async def colab_connection_url() -> dict[str, Any]:
+        """Return the current Colab connection URL without remote calls."""
+        return await session.connection_url()
+
+    @mcp.tool()
+    async def colab_reset_connection(
+        wait_seconds: float = 1.0, open_browser: bool = True
+    ) -> dict[str, Any]:
+        """Restart the local Colab websocket bridge with a fresh token and URL."""
+        jobs.mark_stale("Colab connection was reset")
+        status = await session.reset(
+            wait_seconds=wait_seconds, open_browser=open_browser
+        )
+        return status.__dict__
+
+    @mcp.tool()
     async def colab_list_remote_tools() -> dict[str, Any]:
         """List tools exposed by the connected Colab browser frontend."""
         tools = await session.list_tools()

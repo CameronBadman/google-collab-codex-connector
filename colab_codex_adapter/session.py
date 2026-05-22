@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import time
+import uuid
 import webbrowser
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
@@ -19,6 +22,7 @@ from .bridge import ColabWebSocketServer
 REMOTE_INIT_TIMEOUT_SECONDS = 5.0
 REMOTE_TOOL_LIST_TIMEOUT_SECONDS = 5.0
 REMOTE_TOOL_CALL_TIMEOUT_SECONDS = 300.0
+OPEN_URL_PATH = "/tmp/colab-mcp-open-url"
 
 
 class ColabTransport(ClientTransport):
@@ -47,6 +51,12 @@ class ConnectionStatus:
     remote_mcp_initialized: bool
     url: str
     port: int
+    adapter_pid: int
+    adapter_started_at: float
+    connection_id: str
+    last_state_change: float
+    token_prefix: str
+    open_url_path: str
     remote_tool_count: int | None = None
     last_error: str | None = None
 
@@ -64,6 +74,9 @@ class ColabSessionManager:
         self._remote_tools: list[Tool] | None = None
         self._last_error: str | None = None
         self._lock = asyncio.Lock()
+        self._adapter_started_at = time.time()
+        self._connection_id = uuid.uuid4().hex
+        self._last_state_change = self._adapter_started_at
 
     async def start(self) -> None:
         async with self._lock:
@@ -72,16 +85,30 @@ class ColabSessionManager:
             self._bridge = await self._exit_stack.enter_async_context(
                 ColabWebSocketServer()
             )
+            self._last_state_change = time.time()
             self._start_connect_task()
 
     async def close(self) -> None:
         if self._connect_task:
             self._connect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._connect_task
         await self._exit_stack.aclose()
+        self._exit_stack = AsyncExitStack()
         self._bridge = None
         self._client = None
         self._connect_task = None
         self._remote_tools = None
+        self._last_state_change = time.time()
+
+    async def reset(
+        self, wait_seconds: float = 1.0, open_browser: bool = True
+    ) -> ConnectionStatus:
+        await self.close()
+        self._connection_id = uuid.uuid4().hex
+        self._last_error = None
+        await self.start()
+        return await self.connect(wait_seconds=wait_seconds, open_browser=open_browser)
 
     @property
     def bridge(self) -> ColabWebSocketServer:
@@ -130,16 +157,19 @@ class ColabSessionManager:
             self._client = client
             self._remote_tools = tools
             self._last_error = None
+            self._last_state_change = time.time()
         except asyncio.TimeoutError:
             self._client = None
             self._remote_tools = None
             self._last_error = "Timed out initializing Colab frontend MCP session"
+            self._last_state_change = time.time()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._client = None
             self._remote_tools = None
             self._last_error = f"{type(exc).__name__}: {exc}"
+            self._last_state_change = time.time()
             logging.exception("Failed to initialize Colab frontend MCP client")
 
     async def ensure_connecting(self) -> None:
@@ -185,9 +215,28 @@ class ColabSessionManager:
             remote_mcp_initialized=self.is_connected(),
             url=self.bridge.browser_url,
             port=self.bridge.port,
+            adapter_pid=os.getpid(),
+            adapter_started_at=self._adapter_started_at,
+            connection_id=self._connection_id,
+            last_state_change=self._last_state_change,
+            token_prefix=self.bridge.token[:8],
+            open_url_path=OPEN_URL_PATH,
             remote_tool_count=remote_tool_count,
             last_error=self._last_error,
         )
+
+    async def connection_url(self) -> dict[str, Any]:
+        await self.start()
+        return {
+            "url": self.bridge.browser_url,
+            "port": self.bridge.port,
+            "token_prefix": self.bridge.token[:8],
+            "connection_id": self._connection_id,
+            "adapter_pid": os.getpid(),
+            "adapter_started_at": self._adapter_started_at,
+            "last_state_change": self._last_state_change,
+            "open_url_path": OPEN_URL_PATH,
+        }
 
     def require_client(self) -> Client:
         if not self.is_connected() or self._client is None:
