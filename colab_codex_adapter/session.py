@@ -23,6 +23,7 @@ REMOTE_INIT_TIMEOUT_SECONDS = 5.0
 REMOTE_TOOL_LIST_TIMEOUT_SECONDS = 5.0
 REMOTE_TOOL_CALL_TIMEOUT_SECONDS = 300.0
 OPEN_URL_PATH = "/tmp/colab-mcp-open-url"
+NATIVE_BROWSER_ENV = "COLAB_CODEX_OPEN_NATIVE_BROWSER"
 
 
 class ColabTransport(ClientTransport):
@@ -182,7 +183,7 @@ class ColabSessionManager:
     ) -> ConnectionStatus:
         await self.ensure_connecting()
         if open_browser:
-            webbrowser.open_new(self.bridge.browser_url)
+            self._publish_browser_url()
 
         if self.is_connected():
             return await self.status(include_remote_tools=True)
@@ -194,6 +195,12 @@ class ColabSessionManager:
                 )
 
         return await self.status(include_remote_tools=True)
+
+    def _publish_browser_url(self) -> None:
+        with open(OPEN_URL_PATH, "w", encoding="utf-8") as handle:
+            handle.write(self.bridge.browser_url + "\n")
+        if os.environ.get(NATIVE_BROWSER_ENV) == "1":
+            webbrowser.open_new(self.bridge.browser_url)
 
     async def status(self, include_remote_tools: bool = False) -> ConnectionStatus:
         await self.start()

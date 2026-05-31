@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastmcp import Client
 
 from colab_codex_adapter.server import create_mcp
-from colab_codex_adapter.session import ColabSessionManager
+from colab_codex_adapter.session import ColabSessionManager, OPEN_URL_PATH
 
 
 async def test_static_tool_list_is_available_without_colab_browser() -> None:
@@ -57,3 +59,18 @@ async def test_reset_connection_rotates_connection_metadata() -> None:
     assert first.url != second.url
     assert second.server_listening is True
     assert second.browser_ws_connected is False
+
+
+async def test_connect_writes_open_url_file_without_native_browser() -> None:
+    manager = ColabSessionManager()
+    open_url = Path(OPEN_URL_PATH)
+    try:
+        if open_url.exists():
+            open_url.unlink()
+        status = await manager.connect(wait_seconds=0.01, open_browser=True)
+        assert open_url.exists()
+        assert open_url.read_text(encoding="utf-8").strip() == status.url
+    finally:
+        await manager.close()
+        if open_url.exists():
+            open_url.unlink()

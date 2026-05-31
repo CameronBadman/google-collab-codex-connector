@@ -67,30 +67,28 @@ servers are loaded when the Codex session starts.
 
 ## Browser Shim
 
-The adapter uses Python's `webbrowser.open_new()` to open the Colab connection
-URL. In a Codex-managed background process, launching Firefox directly is not as
-reliable as writing the URL to a file and opening it yourself.
+The adapter writes the Colab connection URL to a file when `colab_connect` is
+called with `open_browser=true`. In a Codex-managed stdio MCP server, launching
+Firefox or `xdg-open` directly is risky because browser subprocess output can
+break or close the MCP stdio transport.
 
-Use this shim at `/tmp/colab-mcp-browser-shim`:
-
-```sh
-#!/bin/sh
-printf '%s\n' "$@" > /tmp/colab-mcp-open-url
-```
-
-Make it executable:
-
-```bash
-chmod +x /tmp/colab-mcp-browser-shim
-```
-
-When `colab_connect` runs, open the full URL written to:
+Read the URL from:
 
 ```text
 /tmp/colab-mcp-open-url
 ```
 
-The URL must include the fragment with `mcpProxyToken` and `mcpProxyPort`.
+Open that full URL in Firefox. The URL must include the fragment with
+`mcpProxyToken` and `mcpProxyPort`.
+
+Native browser launching is disabled by default. To opt into the older behavior,
+set:
+
+```bash
+COLAB_CODEX_OPEN_NATIVE_BROWSER=1
+```
+
+The `BROWSER` shim config is no longer required for normal use.
 
 ## Usage
 
