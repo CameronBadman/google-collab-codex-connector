@@ -111,6 +111,17 @@ sessions make the current connection confusing. It closes the current local
 bridge, creates a fresh token and port, marks running adapter-local jobs as
 `stale`, and returns the new connection status.
 
+Use `colab_adapter_info` to inspect the adapter process, version, log path,
+state file, PID file, and current connection metadata. Outside Codex, run:
+
+```bash
+uv --cache-dir /tmp/uv-cache run colab-codex-doctor
+```
+
+If the doctor reports no running adapter process, the Codex stdio transport is
+gone and Codex must relaunch the MCP server. A stdio MCP server cannot reattach
+itself to an already closed Codex-side transport.
+
 `colab_status` reports the connection phases separately:
 
 - `server_listening`: the local websocket server is bound to a port.
@@ -131,6 +142,7 @@ Primary tools:
 
 - `colab_connect`
 - `colab_status`
+- `colab_adapter_info`
 - `colab_connection_url`
 - `colab_reset_connection`
 - `colab_list_remote_tools`

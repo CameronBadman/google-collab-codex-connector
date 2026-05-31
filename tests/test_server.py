@@ -12,6 +12,7 @@ async def test_static_tool_list_is_available_without_colab_browser() -> None:
         names = {tool.name for tool in await client.list_tools()}
 
     assert {
+        "colab_adapter_info",
         "colab_connect",
         "colab_connection_url",
         "colab_reset_connection",

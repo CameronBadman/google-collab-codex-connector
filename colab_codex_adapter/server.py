@@ -3,12 +3,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import tempfile
+import os
+import time
+import traceback
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
+from . import __version__
+from .diagnostics import (
+    DEFAULT_LOG_DIR,
+    DEFAULT_PID_FILE,
+    DEFAULT_STATE_FILE,
+    adapter_info,
+    write_pid,
+    write_state,
+)
 from .jobs import ColabJobManager, result_data
 from .session import ColabSessionManager, NotConnectedError
 from .tools import (
@@ -67,9 +79,13 @@ async def _append_and_run_code(
     }
 
 
-def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
+def create_mcp(
+    manager: ColabSessionManager | None = None,
+    runtime_info: dict[str, Any] | None = None,
+) -> FastMCP:
     session = manager or ColabSessionManager()
     jobs = ColabJobManager(session)
+    runtime_info = runtime_info or {}
     mcp = FastMCP(
         name="ColabCodexAdapter",
         instructions=(
@@ -93,6 +109,24 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
         """Return current browser connection state and the connection URL."""
         status = await session.status(include_remote_tools=include_remote_tools)
         return status.__dict__
+
+    @mcp.tool()
+    async def colab_adapter_info() -> dict[str, Any]:
+        """Return adapter process, version, log, and current connection metadata."""
+        connection = await session.connection_url()
+        return adapter_info(
+            log_dir=Path(runtime_info.get("log_dir", DEFAULT_LOG_DIR)),
+            log_file=(
+                Path(runtime_info["log_file"]) if runtime_info.get("log_file") else None
+            ),
+            pid_file=Path(runtime_info.get("pid_file", DEFAULT_PID_FILE)),
+            state_file=Path(runtime_info.get("state_file", DEFAULT_STATE_FILE)),
+            extra={
+                **runtime_info,
+                "adapter_version": __version__,
+                "connection": connection,
+            },
+        )
 
     @mcp.tool()
     async def colab_connection_url() -> dict[str, Any]:
@@ -362,16 +396,19 @@ def create_mcp(manager: ColabSessionManager | None = None) -> FastMCP:
     return mcp
 
 
-def init_logger(logdir: str) -> None:
-    log_filename = f"{logdir}/colab-codex-adapter.log"
+def init_logger(logdir: Path) -> Path:
+    logdir.mkdir(parents=True, exist_ok=True)
+    log_filename = logdir / "colab-codex-adapter.log"
     logging.basicConfig(
         format="%(asctime)s %(levelname)s:%(message)s",
-        filename=log_filename,
+        filename=str(log_filename),
         level=logging.INFO,
+        force=True,
     )
     fastmcp_logger.get_logger("colab-codex-adapter").info(
         "logging to %s", log_filename
     )
+    return log_filename
 
 
 def parse_args() -> argparse.Namespace:
@@ -379,20 +416,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-l",
         "--log",
-        default=tempfile.mkdtemp(prefix="colab-codex-adapter-logs-"),
+        type=Path,
+        default=DEFAULT_LOG_DIR,
         help="directory for adapter logs",
+    )
+    parser.add_argument(
+        "--pid-file",
+        type=Path,
+        default=DEFAULT_PID_FILE,
+        help="file where the adapter process id is written",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=DEFAULT_STATE_FILE,
+        help="file where adapter startup state is written",
     )
     return parser.parse_args()
 
 
 async def main_async() -> None:
     args = parse_args()
-    init_logger(args.log)
+    log_file = init_logger(args.log)
+    started_at = time.time()
+    runtime_info = {
+        "adapter_version": __version__,
+        "adapter_pid": os.getpid(),
+        "adapter_started_at": started_at,
+        "log_dir": str(args.log),
+        "log_file": str(log_file),
+        "pid_file": str(args.pid_file),
+        "state_file": str(args.state_file),
+    }
+    write_pid(args.pid_file, os.getpid())
+    write_state(args.state_file, {**runtime_info, "state": "starting"})
     manager = ColabSessionManager()
-    mcp = create_mcp(manager)
-    await manager.start()
+    mcp = create_mcp(manager, runtime_info)
     try:
+        await manager.start()
+        write_state(args.state_file, {**runtime_info, "state": "running"})
         await mcp.run_async()
+    except Exception as exc:
+        logging.exception("Colab Codex adapter exited with an unhandled exception")
+        write_state(
+            args.state_file,
+            {
+                **runtime_info,
+                "state": "crashed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            },
+        )
+        raise
     finally:
         await manager.close()
 
