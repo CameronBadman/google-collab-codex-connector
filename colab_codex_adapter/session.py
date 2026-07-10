@@ -4,9 +4,9 @@ import asyncio
 import contextlib
 import logging
 import os
+import subprocess
 import time
 import uuid
-import webbrowser
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -24,6 +24,7 @@ REMOTE_TOOL_LIST_TIMEOUT_SECONDS = 5.0
 REMOTE_TOOL_CALL_TIMEOUT_SECONDS = 300.0
 OPEN_URL_PATH = "/tmp/colab-mcp-open-url"
 NATIVE_BROWSER_ENV = "COLAB_CODEX_OPEN_NATIVE_BROWSER"
+FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
 class ColabTransport(ClientTransport):
@@ -58,6 +59,9 @@ class ConnectionStatus:
     last_state_change: float
     token_prefix: str
     open_url_path: str
+    browser_launch_attempted: bool
+    browser_launch_succeeded: bool | None
+    browser_launch_error: str | None
     remote_tool_count: int | None = None
     last_error: str | None = None
 
@@ -74,6 +78,9 @@ class ColabSessionManager:
         self._connect_task: asyncio.Task[None] | None = None
         self._remote_tools: list[Tool] | None = None
         self._last_error: str | None = None
+        self._browser_launch_attempted = False
+        self._browser_launch_succeeded: bool | None = None
+        self._browser_launch_error: str | None = None
         self._lock = asyncio.Lock()
         self._adapter_started_at = time.time()
         self._connection_id = uuid.uuid4().hex
@@ -199,8 +206,32 @@ class ColabSessionManager:
     def _publish_browser_url(self) -> None:
         with open(OPEN_URL_PATH, "w", encoding="utf-8") as handle:
             handle.write(self.bridge.browser_url + "\n")
-        if os.environ.get(NATIVE_BROWSER_ENV) == "1":
-            webbrowser.open_new(self.bridge.browser_url)
+        os.chmod(OPEN_URL_PATH, 0o600)
+
+        enabled = os.environ.get(NATIVE_BROWSER_ENV, "1").strip().lower()
+        if enabled in FALSE_ENV_VALUES:
+            return
+
+        self._browser_launch_attempted = True
+        environment = os.environ.copy()
+        environment.pop("BROWSER", None)
+        try:
+            subprocess.Popen(
+                ["xdg-open", self.bridge.browser_url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+                env=environment,
+            )
+        except OSError as exc:
+            self._browser_launch_succeeded = False
+            self._browser_launch_error = f"{type(exc).__name__}: {exc}"
+            logging.warning("Failed to open the Colab URL: %s", exc)
+        else:
+            self._browser_launch_succeeded = True
+            self._browser_launch_error = None
 
     async def status(self, include_remote_tools: bool = False) -> ConnectionStatus:
         await self.start()
@@ -228,6 +259,9 @@ class ColabSessionManager:
             last_state_change=self._last_state_change,
             token_prefix=self.bridge.token[:8],
             open_url_path=OPEN_URL_PATH,
+            browser_launch_attempted=self._browser_launch_attempted,
+            browser_launch_succeeded=self._browser_launch_succeeded,
+            browser_launch_error=self._browser_launch_error,
             remote_tool_count=remote_tool_count,
             last_error=self._last_error,
         )
@@ -243,6 +277,9 @@ class ColabSessionManager:
             "adapter_started_at": self._adapter_started_at,
             "last_state_change": self._last_state_change,
             "open_url_path": OPEN_URL_PATH,
+            "browser_launch_attempted": self._browser_launch_attempted,
+            "browser_launch_succeeded": self._browser_launch_succeeded,
+            "browser_launch_error": self._browser_launch_error,
         }
 
     def require_client(self) -> Client:
