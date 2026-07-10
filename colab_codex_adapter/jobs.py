@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -9,7 +10,10 @@ from typing import Any
 from .session import ColabSessionManager
 from .tools import first_json_object, serialize_tool_result
 
-POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_EXECUTION_TIMEOUT_SECONDS = 43_200.0
+DEFAULT_WAIT_TIMEOUT_SECONDS = 300.0
+MIN_WAIT_TIMEOUT_SECONDS = 1.0
+MAX_WAIT_TIMEOUT_SECONDS = 900.0
 
 
 def result_data(result: Any) -> dict[str, Any]:
@@ -58,7 +62,10 @@ class ColabJob:
     code: str
     state: str
     started_at: float
+    updated_at: float
+    execution_timeout_seconds: float
     finished_at: float | None = None
+    last_output_at: float | None = None
     outputs: list[Any] = field(default_factory=list)
     error: str | None = None
 
@@ -70,7 +77,27 @@ class ColabJobManager:
     def __init__(self, session: ColabSessionManager):
         self.session = session
         self.jobs: dict[str, ColabJob] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._completion_events: dict[str, asyncio.Event] = {}
         self._lock = asyncio.Lock()
+
+    def _job_dict(self, job: ColabJob) -> dict[str, Any]:
+        task = self._tasks.get(job.job_id)
+        return {
+            **job.to_dict(),
+            "task_alive": (
+                job.state == "running" and task is not None and not task.done()
+            ),
+        }
+
+    def _update_outputs(self, job: ColabJob, outputs: list[Any]) -> None:
+        if outputs == job.outputs:
+            return
+        now = time.time()
+        job.outputs = outputs
+        job.updated_at = now
+        if outputs:
+            job.last_output_at = now
 
     async def _remote_tool_names(self) -> set[str]:
         return {tool.name for tool in await self.session.list_tools()}
@@ -88,7 +115,14 @@ class ColabJobManager:
                 return cell
         return None
 
-    async def start_python(self, code: str, language: str = "python") -> dict[str, Any]:
+    async def start_python(
+        self,
+        code: str,
+        language: str = "python",
+        execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        if execution_timeout_seconds <= 0:
+            raise ValueError("execution_timeout_seconds must be greater than zero")
         names = await self._remote_tool_names()
         required = {"add_code_cell", "run_code_cell", "get_cells"}
         if not required.issubset(names):
@@ -104,32 +138,69 @@ class ColabJobManager:
         if not isinstance(cell_id, str):
             raise ValueError("Colab did not return a newCellId from add_code_cell")
 
+        started_at = time.time()
         job = ColabJob(
             job_id=uuid.uuid4().hex,
             cell_id=cell_id,
             code=code,
             state="running",
-            started_at=time.time(),
+            started_at=started_at,
+            updated_at=started_at,
+            execution_timeout_seconds=execution_timeout_seconds,
         )
         async with self._lock:
             self.jobs[job.job_id] = job
-
-        run_result = await self.session.call_tool("run_code_cell", {"cellId": cell_id})
-        run_data = result_data(run_result)
-        outputs = run_data.get("outputs", [])
-        if isinstance(outputs, list) and outputs:
-            self._finish_from_outputs(job, outputs)
+            self._completion_events[job.job_id] = asyncio.Event()
+            self._tasks[job.job_id] = asyncio.create_task(
+                self._execute(job), name=f"colab-job-{job.job_id}"
+            )
         return {
-            **job.to_dict(),
+            **self._job_dict(job),
             "add_result": serialize_tool_result(add_result),
-            "run_result": serialize_tool_result(run_result),
         }
 
+    async def _execute(self, job: ColabJob) -> None:
+        try:
+            run_result = await self.session.call_tool(
+                "run_code_cell",
+                {"cellId": job.cell_id},
+                timeout=job.execution_timeout_seconds,
+            )
+            outputs = result_data(run_result).get("outputs", [])
+            if not isinstance(outputs, list):
+                outputs = []
+            if job.state == "running":
+                self._finish_from_outputs(job, outputs)
+        except asyncio.TimeoutError:
+            if job.state == "running":
+                job.state = "timed_out"
+                job.error = (
+                    "Colab execution exceeded "
+                    f"{job.execution_timeout_seconds:g} seconds"
+                )
+                job.finished_at = job.updated_at = time.time()
+        except asyncio.CancelledError:
+            if job.state == "running":
+                job.state = "stale"
+                job.error = "Colab execution tracking was cancelled"
+                job.finished_at = job.updated_at = time.time()
+            raise
+        except Exception as exc:
+            if job.state == "running":
+                job.state = "error"
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.finished_at = job.updated_at = time.time()
+        finally:
+            self._tasks.pop(job.job_id, None)
+            event = self._completion_events.get(job.job_id)
+            if event is not None:
+                event.set()
+
     def _finish_from_outputs(self, job: ColabJob, outputs: list[Any]) -> None:
-        job.outputs = outputs
+        self._update_outputs(job, outputs)
         job.error = output_error(outputs)
         job.state = "error" if output_has_error(outputs) else "finished"
-        job.finished_at = time.time()
+        job.finished_at = job.updated_at = time.time()
 
     async def status(self, job_id: str) -> dict[str, Any]:
         job = self.jobs.get(job_id)
@@ -141,40 +212,93 @@ class ColabJobManager:
             if cell is None:
                 job.state = "missing"
                 job.error = "Job cell no longer exists in the notebook"
-                job.finished_at = time.time()
+                job.finished_at = job.updated_at = time.time()
+                task = self._tasks.get(job.job_id)
+                if task is not None:
+                    task.cancel()
             else:
                 outputs = cell_outputs(cell)
                 if outputs:
-                    self._finish_from_outputs(job, outputs)
+                    self._update_outputs(job, outputs)
 
-        return job.to_dict()
+        return self._job_dict(job)
 
-    async def wait(self, job_id: str, timeout_seconds: float = 300.0) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout_seconds
+    async def wait(
+        self,
+        job_id: str,
+        timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        if not math.isfinite(timeout_seconds) or not (
+            MIN_WAIT_TIMEOUT_SECONDS
+            <= timeout_seconds
+            <= MAX_WAIT_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "timeout_seconds must be between "
+                f"{MIN_WAIT_TIMEOUT_SECONDS:g} and "
+                f"{MAX_WAIT_TIMEOUT_SECONDS:g}"
+            )
+        wait_started = time.monotonic()
         last_status = await self.status(job_id)
-        while last_status["state"] == "running":
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return {**last_status, "timed_out": True}
-            await asyncio.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+        wait_timed_out = False
+        if last_status["state"] == "running":
+            event = self._completion_events[job_id]
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                wait_timed_out = True
             last_status = await self.status(job_id)
-        return {**last_status, "timed_out": False}
+            if last_status["state"] != "running":
+                wait_timed_out = False
+        waited_seconds = time.monotonic() - wait_started
+        return {
+            **last_status,
+            "timed_out": wait_timed_out,
+            "wait_timed_out": wait_timed_out,
+            "waited_seconds": waited_seconds,
+        }
 
     async def run_python_wait(
-        self, code: str, timeout_seconds: float = 300.0
+        self,
+        code: str,
+        timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+        execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        started = await self.start_python(code)
+        started = await self.start_python(
+            code, execution_timeout_seconds=execution_timeout_seconds
+        )
         waited = await self.wait(started["job_id"], timeout_seconds)
         return {**waited, "start_result": started}
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        return [job.to_dict() for job in self.jobs.values()]
+        return [self._job_dict(job) for job in self.jobs.values()]
 
-    def mark_stale(self, reason: str) -> None:
+    async def mark_stale(self, reason: str) -> None:
         now = time.time()
+        tasks: list[asyncio.Task[None]] = []
         for job in self.jobs.values():
-            if job.state in {"finished", "error", "missing", "stale"}:
+            if job.state in {
+                "finished",
+                "error",
+                "timed_out",
+                "missing",
+                "stale",
+            }:
                 continue
             job.state = "stale"
             job.error = reason
-            job.finished_at = now
+            job.finished_at = job.updated_at = now
+            task = self._tasks.get(job.job_id)
+            if task is not None:
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for job in self.jobs.values():
+            if job.state == "stale":
+                event = self._completion_events.get(job.job_id)
+                if event is not None:
+                    event.set()
+
+    async def close(self) -> None:
+        await self.mark_stale("Colab adapter shut down")

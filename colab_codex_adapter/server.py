@@ -21,7 +21,12 @@ from .diagnostics import (
     write_pid,
     write_state,
 )
-from .jobs import ColabJobManager, result_data
+from .jobs import (
+    DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    DEFAULT_WAIT_TIMEOUT_SECONDS,
+    ColabJobManager,
+    result_data,
+)
 from .session import ColabSessionManager, NotConnectedError
 from .tools import (
     call_resolved_tool,
@@ -138,7 +143,7 @@ def create_mcp(
         wait_seconds: float = 1.0, open_browser: bool = True
     ) -> dict[str, Any]:
         """Restart the local Colab websocket bridge with a fresh token and URL."""
-        jobs.mark_stale("Colab connection was reset")
+        await jobs.mark_stale("Colab connection was reset")
         status = await session.reset(
             wait_seconds=wait_seconds, open_browser=open_browser
         )
@@ -335,9 +340,14 @@ def create_mcp(
         )
 
     @mcp.tool()
-    async def colab_run_python_async(code: str) -> dict[str, Any]:
+    async def colab_run_python_async(
+        code: str,
+        execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         """Start a tracked Python cell job and return its job id."""
-        return await jobs.start_python(code)
+        return await jobs.start_python(
+            code, execution_timeout_seconds=execution_timeout_seconds
+        )
 
     @mcp.tool()
     async def colab_job_status(job_id: str) -> dict[str, Any]:
@@ -346,17 +356,23 @@ def create_mcp(
 
     @mcp.tool()
     async def colab_wait_job(
-        job_id: str, timeout_seconds: float = 300.0
+        job_id: str, timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS
     ) -> dict[str, Any]:
         """Wait until a tracked Colab job finishes or the timeout expires."""
         return await jobs.wait(job_id, timeout_seconds)
 
     @mcp.tool()
     async def colab_run_python_wait(
-        code: str, timeout_seconds: float = 300.0
+        code: str,
+        timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+        execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Run Python in a tracked cell job and wait for its outputs."""
-        return await jobs.run_python_wait(code, timeout_seconds)
+        return await jobs.run_python_wait(
+            code,
+            timeout_seconds,
+            execution_timeout_seconds=execution_timeout_seconds,
+        )
 
     @mcp.tool()
     async def colab_list_jobs() -> dict[str, Any]:
