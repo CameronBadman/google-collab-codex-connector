@@ -1,55 +1,86 @@
 # Google Colab Codex Connector
 
-A stable Model Context Protocol (MCP) adapter that lets Codex inspect, edit,
-and execute Google Colab notebooks. It also supports native Codex workers using
-a separately configured model while sharing the parent's Colab session.
+An MCP connector that lets Codex inspect, edit, and execute Google Colab
+notebooks through the browser-side Colab MCP frontend. It exposes a stable
+`colab_*` tool surface before the browser connects. One detached connector
+service owns the notebook session for the local user; parent agents and native
+Codex workers reach that service through disposable stdio shims.
 
-The upstream `googlecolab/colab-mcp` integration discovers notebook tools after
-the browser connects and announces them through `notifications/tools/list_changed`.
-Codex does not always refresh that dynamic tool list. This connector exposes a
-static `colab_*` tool surface from startup and resolves each operation against
-the live Colab frontend after connection.
+> **Project status:** experimental. Version `0.3.0` targets one trusted local
+> user, one active Colab browser tab, and one notebook runtime. It is not a
+> hosted or multi-tenant service.
 
-> **Project status:** functional and tested, but still experimental. The current
-> release is designed for one trusted user, one local Codex run, and one Colab
-> notebook. It is not a hosted or multi-tenant service.
+## Reliability Model
 
-## Highlights
+- One detached loopback service owns the browser bridge, notebook session, job
+  registry, and artifact store independently of any Codex stdio shim.
+- Stdio shims discover the current service generation and automatically elect
+  exactly one replacement owner when the active owner dies.
+- Browser disconnects discard per-connection MCP streams. The same Colab tab,
+  URL, and token can reconnect without resetting the bridge.
+- Connect and reset operations default to `open_browser=False`; recovery never
+  opens a surprise browser tab.
+- Job status checks never download accumulated notebook outputs. Timed waits
+  use a local completion event and make no Colab request on timeout.
+- Reconnected jobs are rechecked through bounded runtime markers every 15
+  seconds by default until they become terminal.
+- Final MCP results are capped at 256 KiB by default. Larger data is exposed by
+  an opaque, chunk-readable artifact reference.
+- WebSocket frames have a finite 32 MiB ceiling. This is transport headroom,
+  not permission to return unbounded notebook data.
 
-- Stable tools visible to Codex before the browser connects.
-- Notebook inspection, cell creation, editing, movement through raw tools, and
-  execution.
-- Immediate background job IDs for long-running Python and training cells.
-- One shared Colab session and job registry across native Codex subagents.
-- Project-scoped worker profiles with an explicitly selected Codex model.
-- Connection diagnostics, stale-session recovery, and a raw-tool escape hatch
-  for upstream schema changes.
-- Authenticated loopback broker with private runtime state.
+The connector does not add Google Drive synchronization, Drive authentication,
+or Drive-specific workflow features.
 
 ## Architecture
 
 ```text
-                         Google Colab browser tab
-                                  |
-                         authenticated WebSocket
-                                  |
-                     +------------v-------------+
-                     | shared connector broker  |
-                     | session, tools, and jobs |
-                     +------+-------------+-----+
-                            |             |
-                    loopback MCP     loopback MCP
-                            |             |
-                  +---------v--+     +----v----------+
-                  | parent     |     | Codex worker  |
-                  | stdio MCP  |     | stdio MCP     |
-                  +------------+     +---------------+
+                       one Google Colab browser tab
+                                   |
+                       authenticated WebSocket
+                                   |
+                     +-------------v-------------+
+                     | shared connector service |
+                     | bridge, session, jobs,    |
+                     | bounded artifact service  |
+                     +------+------+-------------+
+                            |      |
+                 authenticated    authenticated
+                 loopback MCP     loopback MCP
+                            |      |
+                     +------v--+ +-v------------+
+                     | parent  | | Codex worker |
+                     | stdio   | | stdio        |
+                     +---------+ +--------------+
 ```
 
-Codex starts a separate stdio MCP process for a spawned agent. The first
-adapter process becomes the broker owner; later processes proxy to it. Both
-agents therefore observe the same `connection_id`, notebook state, and tracked
-jobs instead of opening competing Colab bridges.
+The singleton boundary is the stateful connector service, not an individual MCP
+transport. Codex may start a lightweight stdio shim for each parent or worker
+session; all shims discover and use the same service instance. Before each
+request, a shim rechecks protected discovery state so it does not remain pinned
+to a dead owner. A launch lock serializes replacement, while a lifetime lock
+identifies the active daemon. Closing one or every stdio shim does not terminate
+the service or an active notebook job. A later shim reconnects to the same
+instance.
+
+### Service Identity
+
+`colab_adapter_info` reports the shared service through canonical fields:
+
+| Field | Meaning |
+| --- | --- |
+| `service_instance_id` | Stable logical identity retained across compatible owner replacement. |
+| `service_pid` | PID of the process currently hosting the service. |
+| `service_owner_id` | Process-specific owner identity used to reject stale state. |
+| `service_generation` | Monotonic owner generation. |
+| `service_started_at` | Start time of the current service owner. |
+| `service_status` / `service_healthy` | Published lifecycle state and endpoint health. |
+| `instance_scope` | `user`; trusted local conversations intentionally share the service. |
+| `transport` | `stdio`; describes the Codex-facing shim transport. |
+
+The existing `adapter_*` and `broker_*` fields remain compatibility aliases.
+They describe the shared service and must not be interpreted as the identity of
+the calling stdio shim.
 
 ## Requirements
 
@@ -57,18 +88,17 @@ jobs instead of opening competing Colab bridges.
 - Python 3.13 or newer.
 - [`uv`](https://docs.astral.sh/uv/).
 - A local Codex client with MCP support.
-- A Google Colab browser session.
+- A signed-in Google Colab browser session.
 
 ## Installation
 
 ```bash
 git clone https://github.com/CameronBadman/google-collab-codex-connector.git
 cd google-collab-codex-connector
-uv --cache-dir /tmp/uv-cache sync
+uv --cache-dir /tmp/uv-cache sync --group dev
 ```
 
-Configure the connector in `~/.codex/config.toml`. Replace `cwd` with the path
-to your checkout:
+Add the connector to `~/.codex/config.toml`, replacing `cwd` with the checkout:
 
 ```toml
 [mcp_servers.colab]
@@ -84,99 +114,68 @@ UV_TOOL_DIR = "/tmp/uv-tools"
 COLAB_CODEX_BROKER_PORT = "8765"
 ```
 
-Restart Codex after changing MCP configuration or connector code. Codex loads
-MCP servers when a session starts.
+After changing MCP configuration, restart Codex. After upgrading connector
+code, stop the detached service first so the next shim starts the matching
+backend, then restart Codex:
+
+```bash
+uv --cache-dir /tmp/uv-cache run colab-codex-broker-stop
+```
+
+Stopping the service interrupts active connector-side job tracking, so complete
+or checkpoint important work before upgrading.
 
 ## Quick Start
 
-1. Ask Codex to call `colab_status`.
-2. If it is disconnected, call `colab_connect`.
-3. The connector opens the URL in the desktop default browser. If desktop
-   launching is unavailable, open `/tmp/colab-mcp-open-url` manually.
-4. Call `colab_status` again and confirm `remote_mcp_initialized` is `true`.
-5. Inspect the notebook with `colab_get_notebook` or execute code with
+1. Call `colab_status`.
+2. Call `colab_connect(open_browser=False)`. This starts or discovers the
+   bridge but does not launch a browser.
+3. Use `colab_connection_url` and open its URL in the intended Colab tab, or
+   explicitly call `colab_connect(open_browser=True)` once to use `xdg-open`.
+4. Confirm `browser_alive` and `runtime_alive` are both `true` in
+   `colab_status`.
+5. Inspect the notebook with `colab_get_notebook` or run code with
    `colab_run_python`.
 
-The connection URL includes the `mcpProxyToken` and `mcpProxyPort` fragment;
-open it without removing that fragment. The launcher is detached with all
-standard file descriptors redirected away from MCP stdio. To disable automatic
-browser launching:
+The URL contains `mcpProxyToken` and `mcpProxyPort` in its fragment; do not
+remove them. When explicit desktop launching is requested, the URL is also
+written to `/tmp/colab-codex-adapter/open-url` with mode `0600`. Disable native launching
+entirely with `COLAB_CODEX_OPEN_NATIVE_BROWSER=0`.
 
-```bash
-COLAB_CODEX_OPEN_NATIVE_BROWSER=0
-```
+Set `COLAB_CODEX_NOTEBOOK_URL` to an existing notebook URL to avoid opening the
+default `empty.ipynb`. Only HTTPS URLs on `colab.research.google.com` and
+`colab.google.com` are accepted.
 
-## Native Codex Worker
+### Reconnection
 
-The connector can install a project-scoped `colab_worker` custom agent. You
-choose the worker model explicitly; the connector does not silently select or
-fall back to a model.
+When the browser WebSocket drops, the bridge returns to its listening state and
+clears the disconnected frontend client and tool cache. Reopening or refreshing
+the same tab reuses the token, URL, port, and connector identity while creating
+fresh MCP streams. No reset is needed. A second simultaneous browser is rejected
+without disconnecting the active tab.
 
-From the connector checkout, run:
-
-```bash
-uv --cache-dir /tmp/uv-cache run colab-codex-agent-init \
-  --project /absolute/path/to/your/project \
-  --model YOUR_WORKER_MODEL \
-  --reasoning-effort medium
-```
-
-This writes:
-
-```text
-<project>/.codex/agents/colab-worker.toml
-```
-
-The generated worker:
-
-- Uses `workspace-write` access for the repository.
-- Inherits the project's `colab` MCP tools.
-- Owns repository and notebook mutations while its assignment is active.
-- Reports a gated checkpoint after environment setup and each completed
-  experiment or evaluation.
-- Chooses its own `1-900` second job-wait interval from the expected next useful
-  signal instead of waking the parent on a fixed schedule.
-- Waits for the parent to review evidence and issue the next instruction.
-- Does not create nested agents.
-
-Start a new Codex session after installing or changing the profile. Delegate
-explicitly:
-
-```text
-Use the colab_worker agent for this experiment. Do not edit while it owns the
-assignment. Review each checkpoint and send the next instruction to the same
-worker thread.
-```
-
-At a checkpoint the worker reports its changes, evidence, metrics,
-interpretation, recommendation, decision needed, and proposed next step. The
-parent remains the supervisor; the worker remains a native Codex agent rather
-than a separate Responses API loop.
-
-While a job is running, the worker stays inside its active turn. It normally
-uses `10-60` second waits for setup, `60-300` seconds for evaluation, and
-`300-900` seconds for training. After a wait expires it inspects the new job
-state and selects the next interval from the evidence. The parent is not
-invoked merely because a polling timer elapsed.
+Use `colab_reset_connection` only for an explicit identity/token rotation. It
+also defaults to `open_browser=False`.
 
 ## Tool Reference
 
 | Area | Tools | Purpose |
 | --- | --- | --- |
-| Connection | `colab_connect`, `colab_status`, `colab_connection_url`, `colab_reset_connection` | Establish, inspect, or replace the browser bridge. |
-| Diagnostics | `colab_adapter_info`, `colab_list_remote_tools` | Inspect broker, connection, and upstream tool metadata. |
-| Notebook | `colab_get_notebook`, `colab_add_cell`, `colab_update_cell`, `colab_run_cell` | Read and modify notebook cells. |
-| Python | `colab_run_python`, `colab_install_package` | Execute code or install packages synchronously. |
-| Jobs | `colab_run_python_async`, `colab_job_status`, `colab_wait_job`, `colab_run_python_wait`, `colab_list_jobs` | Run and monitor long-lived execution. |
-| Escape hatch | `colab_call_remote_tool` | Call an exact browser-side tool when a wrapper no longer matches Colab. |
+| Connection | `colab_connect`, `colab_status`, `colab_connection_url`, `colab_reset_connection` | Establish, inspect, or deliberately replace the browser bridge. |
+| Diagnostics | `colab_adapter_info`, `colab_list_remote_tools` | Inspect independent broker, browser, runtime, and connection state. |
+| Notebook | `colab_get_notebook`, `colab_add_cell`, `colab_update_cell`, `colab_run_cell` | Read or modify cells; execute existing CPython source through a bounded tracked job. Notebook-wide output reads are disabled. |
+| Python | `colab_run_python`, `colab_install_package` | Execute short synchronous code or install packages. |
+| Jobs | `colab_run_python_async`, `colab_job_status`, `colab_wait_job`, `colab_run_python_wait`, `colab_list_jobs` | Run and observe long CPython workloads. |
+| Artifacts | `colab_read_artifact` | Read an issued artifact in bounded chunks. |
+| Safety guard | `colab_call_remote_tool` | Reject raw frontend calls whose output cannot be bounded before crossing WebSocket transport. |
 
-Use notebook tools only after `remote_mcp_initialized` becomes `true`.
-`colab_connection_url` is local-only and remains safe to call when the browser
-side is stale or only partially connected.
+Use remote notebook tools only after `runtime_alive` becomes `true`.
+`colab_connection_url` is local-only and remains available while the frontend
+is disconnected.
 
 ## Background Jobs
 
-Start long-running execution without holding a Codex tool call open:
+Start a tracked CPython job without holding the initiating tool call open:
 
 ```text
 colab_run_python_async(
@@ -185,52 +184,126 @@ colab_run_python_async(
 )
 ```
 
-The tool creates a notebook cell, schedules its blocking `run_code_cell`
-request in the broker, and returns a `job_id` immediately. Poll with
-`colab_job_status` or wait in bounded intervals with `colab_wait_job`.
+Managed execution accepts CPython source only. Raw frontend execution, IPython
+magics, and shell syntax are excluded because their output cannot be bounded
+before it crosses the browser transport. Execution deadlines must be finite and
+no greater than 86,400 seconds.
 
-`colab_wait_job` accepts `timeout_seconds` from `1` through `900`. It waits on a
-broker completion event and returns immediately when execution finishes; it
-does not query Colab once per second. A timeout performs one status refresh and
-returns `wait_timed_out`, `waited_seconds`, `updated_at`, `last_output_at`, and
-`task_alive` so the worker can choose its next observation interval.
+The wrapper records a compact completion marker and bounded output artifact
+under `/content/.colab_codex/jobs/`. The blocking `run_code_cell` request is the
+only normal source of final target-cell output. While a job runs:
 
-Job states are:
+- `colab_job_status` calls `get_cells(includeOutputs=False)` only to confirm
+  that the target cell still exists; bounded range requests are used for
+  notebook scans and unrelated notebook outputs are not read.
+- `colab_wait_job` accepts `timeout_seconds` from `1` through `900`, waits on a
+  local event, and returns cached metadata on timeout without a remote request.
+- `colab_list_jobs` returns metadata only and omits output excerpts.
+- Submitted source and raw cell-creation results are never echoed. Responses
+  expose `code_bytes` and `code_sha256` instead.
 
-- `running`: the browser-side execution request is active.
-- `finished`: execution completed, including successful cells with no output.
-- `error`: Colab returned an error output or the remote request failed.
-- `timed_out`: execution exceeded `execution_timeout_seconds`.
-- `missing`: the tracked notebook cell was removed.
-- `stale`: the connection was reset or the broker shut down.
+Completed executions release their notebook cell back to a connector-owned
+pool. The pool defaults to 16 cells, bounds persistent wrapper source growth,
+and rejects additional concurrent work when every pooled cell is still owned by
+an unfinished job. The reusable recovery-probe cell is persisted across broker
+replacement rather than appended again.
 
-`colab_wait_job(..., timeout_seconds=300)` timing out does not cancel the job.
-The execution continues until it reaches a terminal state or its independent
-execution timeout.
+A browser disconnect never causes `run_code_cell` to be replayed. The job moves
+to `tracking_state="detached"`, with `execution_alive=null` because execution
+cannot be known from transport state alone. After the browser reconnects,
+bounded reconciliation probes read connector-owned completion markers. Running
+markers are polled at the configured interval until terminal or until the job's
+execution timeout plus recovery grace has elapsed. A terminal marker completes
+the original job; a missing or stale marker produces `state="interrupted"`.
+The connector never guesses by rerunning user code.
 
-Jobs are in memory, owned by the root broker, and shared by agent proxies. They
-do not survive the root Codex session ending.
+Bounded metadata for up to 1,024 jobs is journaled atomically to the private
+local state directory. The journal contains no submitted code, errors, output
+excerpts, or corpus data. A replacement broker restores unfinished entries as
+detached and reconciles them against their runtime markers after reconnect.
 
-## Connection and Broker Details
+Useful job fields include:
 
-The browser-facing bridge accepts one authenticated Colab WebSocket. The
-agent-facing broker listens only on `127.0.0.1`, uses a random bearer token,
-and stores its state under `/tmp/colab-codex-adapter` with user-only
-permissions. The token is never returned by `colab_adapter_info` or the doctor.
+- `state`: `running`, `finished`, `error`, `timed_out`, `missing`, `stale`, or
+  `interrupted`.
+- `tracking_state`: `active`, `detached`, `recovering`, or `complete`.
+- `task_alive`: whether the broker still has a local tracking task.
+- `execution_alive`: `true`, `false`, or `null` when Colab execution is unknown.
+- `output_bytes`, `output_excerpt_bytes`, and `output_truncated`.
+- `output_artifact` and `output_unavailable_reason`.
+- `wait_timed_out` and `waited_seconds` on wait responses.
 
-The default broker port is `8765`. Set the same
-`COLAB_CODEX_BROKER_PORT` value for every connector instance if it must be
-changed. A stale broker state file is removed automatically when a new owner
-acquires the process lock.
+## Bounded Results and Artifacts
 
-Useful connection fields include:
+The default job excerpt is 64 KiB and the final serialized MCP response budget
+is 256 KiB. Complete arrays, checkpoints, rich display payloads, large logs,
+and notebook histories are never inlined. If a result exceeds the budget, the
+response contains compact size, checksum, truncation, and artifact metadata.
 
-- `server_listening`: the local Colab WebSocket bridge has bound a port.
-- `browser_ws_connected`: a Colab tab opened the bridge.
-- `remote_mcp_initialized`: browser-side MCP initialization completed.
-- `remote_tool_count`: number of discovered Colab frontend tools.
-- `connection_id`: identity shared by the parent and its workers.
-- `broker_pid`: process that owns the Colab session and jobs.
+Read issued artifacts with:
+
+```text
+colab_read_artifact(artifact_id="...", offset=0, limit_bytes=65536)
+```
+
+Chunks are at most 64 KiB and are returned as UTF-8 when valid or base64
+otherwise. Each response includes the next offset, EOF flag, stored size, and
+SHA-256 metadata. IDs are opaque and only connector-issued IDs are accepted.
+
+Runtime output artifacts remain in the current Colab runtime. Runtime and local
+artifacts default to a 32 MiB individual limit, 256 MiB total quota, 24-hour
+expiry, and oldest-first eviction. Local storage uses `0700` directories and
+`0600` files. The broker retains at most 1,024 tracked job records by default.
+
+## Broker Recovery
+
+Broker discovery state is stored under `/tmp/colab-codex-adapter` with user-only
+permissions. It includes the stable service instance ID, owner PID/UUID,
+protocol version, generation, endpoint, and a private bearer token. Tokens are
+not passed in daemon command line arguments or returned by diagnostics.
+
+When a proxy detects a dead endpoint, it rereads discovery state and contends
+for the launch lock. Exactly one proxy starts a detached replacement and
+publishes the next generation; the others attach after its health check passes.
+Read-only discovery is retried once after recovery. Mutating requests with an
+ambiguous outcome are not replayed; the proxy recovers the broker and returns an
+explicit outcome-unknown error so callers can inspect job/status state first.
+
+For an intentional upgrade or test teardown, stop the detached daemon with:
+
+```bash
+uv --cache-dir /tmp/uv-cache run colab-codex-broker-stop
+```
+
+Use `--owner-id` to require a specific discovered owner before signaling it.
+The next adapter request starts a replacement.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `COLAB_CODEX_BROKER_PORT` | `8765` | Authenticated loopback broker port. |
+| `COLAB_CODEX_NOTEBOOK_URL` | Colab `empty.ipynb` | Validated browser launch target. |
+| `COLAB_CODEX_WS_MAX_FRAME_BYTES` | `33554432` | Finite WebSocket frame limit; cannot exceed 32 MiB. |
+| `COLAB_CODEX_MAX_TOOL_RESPONSE_BYTES` | `262144` | Final serialized MCP result budget. |
+| `COLAB_CODEX_JOB_OUTPUT_EXCERPT_BYTES` | `65536` | Maximum cached job output excerpt. |
+| `COLAB_CODEX_MAX_SUBMITTED_CODE_BYTES` | `1048576` | Maximum UTF-8 source bytes sent through the browser connector. |
+| `COLAB_CODEX_CELL_METADATA_PAGE_SIZE` | `8` | Maximum cells requested in one output-free notebook metadata frame. |
+| `COLAB_CODEX_MAX_TRACKED_JOBS` | `1024` | In-memory job records; oldest completed jobs are evicted first. |
+| `COLAB_CODEX_MAX_JOB_CELLS` | `16` | Maximum reusable connector-owned execution cells; also bounded by the tracked-job limit. |
+| `COLAB_CODEX_JOB_JOURNAL_PATH` | `/tmp/colab-codex-adapter/jobs.json` | Private bounded job-metadata journal. |
+| `COLAB_CODEX_JOB_RECONCILIATION_POLL_SECONDS` | `15` | Poll interval for detached jobs whose runtime marker is still running. |
+| `COLAB_CODEX_RUNTIME_STALE_GRACE_SECONDS` | `300` | Recovery grace after a job's execution deadline before a running marker is considered interrupted. |
+| `COLAB_CODEX_REMOTE_INIT_TIMEOUT_SECONDS` | `30` | Browser frontend MCP initialization timeout. |
+| `COLAB_CODEX_REMOTE_TOOL_LIST_TIMEOUT_SECONDS` | `30` | Browser tool-discovery timeout. |
+| `COLAB_CODEX_ARTIFACT_DIR` | `/tmp/colab-codex-adapter/artifacts` | Private local artifact directory. |
+| `COLAB_CODEX_MAX_ARTIFACT_BYTES` | `33554432` | Maximum bytes stored per local/runtime artifact. |
+| `COLAB_CODEX_MAX_ARTIFACT_TOTAL_BYTES` | `268435456` | Local and Colab-runtime artifact quota. |
+| `COLAB_CODEX_ARTIFACT_TTL_SECONDS` | `86400` | Local and Colab-runtime artifact lifetime. |
+| `COLAB_CODEX_ARTIFACT_PROBE_TIMEOUT_SECONDS` | `30` | Maximum time a runtime artifact read waits behind a busy kernel. |
+
+Limits must remain finite. Raising the WebSocket ceiling is not a substitute
+for keeping tool and job responses bounded.
 
 ## Diagnostics
 
@@ -240,87 +313,97 @@ Run the doctor outside Codex:
 uv --cache-dir /tmp/uv-cache run colab-codex-doctor
 ```
 
-It reports the owner PID, process state, log path, connection metadata, and a
-redacted broker record. If it reports
-`adapter_process_running_without_shared_broker`, an older adapter is still
-running; restart Codex to load the multi-agent connector.
+The report diagnoses the shared service independently of any stdio shim. It
+distinguishes:
 
-The worker installer also checks the effective project/global Codex MCP
-configuration. If `tool_timeout_sec` is missing or below `1200`, it prints the
-exact required change. It never rewrites Codex configuration automatically.
+- the stable service instance ID, current owner PID, process-start identity,
+  owner UUID, generation, endpoint health, and owner transition;
+- an optional per-shim PID only when explicit per-shim diagnostic paths were
+  supplied; no shim is treated as the canonical connector process;
+- browser and runtime liveness reported by connector tools;
+- the protected state paths needed for local troubleshooting.
+
+WebSocket diagnostics include the last close code and sanitized reason, browser
+generation, accepted/rejected connection counts, rejected oversized-frame
+bytes, and frame/byte maxima. Job
+diagnostics include connection and job IDs plus independent tracking and
+execution liveness. Tokens, token-bearing URL fragments, submitted code,
+outputs, prompts, corpus contents, tool arguments, and tool results are removed
+from persistent diagnostic state.
 
 | Symptom | Action |
 | --- | --- |
-| Only bootstrap or no `colab_*` tools appear | Confirm the MCP `cwd`, then restart Codex. |
-| `browser_ws_connected` is `false` | Call `colab_connect`; if automatic launch fails, open `/tmp/colab-mcp-open-url`. |
-| Browser connected but MCP is not initialized | Close stale Colab tabs, call `colab_reset_connection`, and open the new URL. |
-| Broker port is already in use | Choose another `COLAB_CODEX_BROKER_PORT` and restart all related Codex sessions. |
+| `browser_alive` is `false` | Refresh or reopen the same configured notebook URL; do not reset first. |
+| Browser is alive but `runtime_alive` is `false` | Allow up to the configured 30-second initialization/tool-list stages, then inspect close diagnostics. |
+| A second tab cannot connect | Close the unintended tab; only one active browser is allowed. |
+| Broker owner is not running | Make any connector request; one proxy will elect a replacement. |
 | Worker waits fail near five minutes | Set `mcp_servers.colab.tool_timeout_sec = 1200` and restart Codex. |
-| A job becomes `stale` | Reconnect Colab and start a new job; stale jobs cannot be resumed. |
-| A wrapper fails after a Colab update | Inspect `colab_list_remote_tools`, then use `colab_call_remote_tool` with the exact schema. |
+| A job is `detached` | Reconnect the same browser tab and allow marker reconciliation; do not rerun it manually. |
+| An artifact ID is unknown | It expired, was evicted, belonged to a previous runtime, or was not connector-issued. |
+| An artifact read reports a busy runtime | Retry after the currently executing cell yields the kernel. |
 
-Adapter logs default to:
+Adapter logs default to
+`/tmp/colab-codex-adapter/logs/colab-codex-adapter.log`.
 
-```text
-/tmp/colab-codex-adapter/logs/colab-codex-adapter.log
+## Native Codex Worker
+
+Install a project-scoped `colab_worker` profile with an explicitly selected
+model:
+
+```bash
+uv --cache-dir /tmp/uv-cache run colab-codex-agent-init \
+  --project /absolute/path/to/your/project \
+  --model YOUR_WORKER_MODEL \
+  --reasoning-effort medium
 ```
 
-## Current Limitations
+The generated worker inherits the project's Colab tools, owns repository and
+notebook mutations for its assignment, reports gated checkpoints, and chooses
+its own `1-900` second wait interval. It normally waits `10-60` seconds for
+setup, `60-300` for evaluation, and `300-900` for training. A wait timeout does
+not wake the parent or cancel execution.
 
-- Colab does not expose CPU/GPU/TPU selection or runtime reconnection through
-  this MCP surface. Change hardware manually through **Runtime -> Change
-  runtime type** in Colab.
-- The broker and job registry are process-local and end with the root Codex
-  adapter.
-- V1 assumes one trusted local user, one active root Codex workflow, one worker,
-  and one connected notebook.
-- Exclusive parent/worker edit ownership is an orchestration rule; MCP calls do
-  not carry a reliable agent identity that the connector can lock against.
-- Resetting the browser connection invalidates running job tracking.
-- The raw remote-tool escape hatch is intentionally powerful and should be used
-  only after inspecting the live schema.
+## Security and Limitations
 
-## Security Model
+- Browser and broker tokens are independent. Runtime state and artifacts are
+  private to the local OS user.
+- The broker binds only to `127.0.0.1` and requires bearer authentication.
+- Notebook URLs are restricted to approved HTTPS Colab hosts.
+- One trusted local workflow and one active browser tab are supported. There is
+  no tenant isolation or remote security boundary.
+- Colab hardware selection and runtime reconnection remain browser operations.
+- Runtime artifacts disappear when the Colab runtime is replaced.
+- Raw remote-tool calls and direct unwrapped cell execution are disabled on the
+  managed-safe surface. Remote tool-name overrides are also rejected.
+- Notebook metadata is read in bounded pages. A single pre-existing cell whose
+  source alone exceeds the configured WebSocket frame limit still cannot be
+  inspected until the frontend supports chunked cell-source reads.
+- Managed code should not intentionally leave permanent Python background
+  threads. Short-lived and descendant-thread output is captured or suppressed,
+  but a permanently live thread retains its output guard for the life of that
+  thread.
 
-- The broker binds to loopback and requires a random bearer token.
-- Runtime directories use mode `0700`; broker state and lock files use `0600`.
-- Browser and broker tokens are separate.
-- Diagnostic output removes the broker token.
-- No credentials are stored in the generated worker profile.
-
-The connector does not provide tenant isolation, remote authentication, or a
-hosted security boundary. Do not expose the loopback broker through a public
-proxy.
+Do not expose the loopback broker through a public proxy.
 
 ## Development
-
-Install development dependencies and run the suite:
 
 ```bash
 uv --cache-dir /tmp/uv-cache sync --group dev
 uv --cache-dir /tmp/uv-cache run pytest -q
-```
-
-Build distributable artifacts:
-
-```bash
 uv --cache-dir /tmp/uv-cache build
 ```
 
-The tests cover static tool discovery, browser connection state, tool-schema
-adaptation, real background job transitions, broker authentication and owner
-election, stale-state recovery, agent-profile installation, diagnostics
-redaction, and two independent stdio adapters sharing one broker.
+The test suite covers bounded large-output behavior, WebSocket frame limits,
+same-token browser reconnection, second-tab rejection, zero-I/O job waits,
+in-flight and concurrent broker replacement, artifact permissions and quotas,
+diagnostic redaction, agent installation, eight concurrent stdio shims sharing
+one service, shim-independent service lifetime, and an integrated long-job
+reconnect with 2 MiB of unrelated notebook output plus artifact checksum
+verification.
 
-When submitting a change, include focused tests for altered tool contracts,
-connection lifecycle behavior, or job-state transitions.
-
-## Roadmap
-
-- Durable worker and job recovery across Codex restarts.
-- A supported cancellation path when Colab exposes an interrupt primitive.
-- Broader platform support beyond `fcntl`-based local ownership.
-- Compatibility tracking as the Colab frontend MCP schema evolves.
+The automated suite runs that reconnect workflow against a protocol-real local
+frontend. Manual release verification should repeat it in a signed-in Colab tab
+to cover browser and kernel behavior. No Drive workflow is required.
 
 Issues and pull requests are welcome at
 [`CameronBadman/google-collab-codex-connector`](https://github.com/CameronBadman/google-collab-codex-connector).

@@ -1,7 +1,7 @@
 [project]
 name = "google-collab-codex-con"
-version = "0.2.0"
-description = "Codex-compatible static MCP adapter for Google Colab MCP session proxy"
+version = "0.3.0"
+description = "Resilient Codex MCP connector for Google Colab notebook sessions"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 colab-codex-adapter = "colab_codex_adapter.server:main"
 colab-codex-doctor = "colab_codex_adapter.diagnostics:main"
+colab-codex-broker-stop = "colab_codex_adapter.diagnostics:broker_stop_main"
 colab-codex-agent-init = "colab_codex_adapter.agent_setup:main"
 
 [build-system]
