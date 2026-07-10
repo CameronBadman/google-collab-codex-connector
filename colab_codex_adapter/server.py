@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -9,10 +10,19 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
+from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.utilities import logging as fastmcp_logger
 
 from . import __version__
+from .broker import (
+    DEFAULT_BROKER_HOST,
+    DEFAULT_BROKER_LOCK_FILE,
+    DEFAULT_BROKER_PORT,
+    DEFAULT_BROKER_STATE_FILE,
+    BrokerCoordinator,
+    BrokerState,
+)
 from .diagnostics import (
     DEFAULT_LOG_DIR,
     DEFAULT_PID_FILE,
@@ -87,9 +97,11 @@ async def _append_and_run_code(
 def create_mcp(
     manager: ColabSessionManager | None = None,
     runtime_info: dict[str, Any] | None = None,
+    job_manager: ColabJobManager | None = None,
+    auth: Any = None,
 ) -> FastMCP:
     session = manager or ColabSessionManager()
-    jobs = ColabJobManager(session)
+    jobs = job_manager or ColabJobManager(session)
     runtime_info = runtime_info or {}
     mcp = FastMCP(
         name="ColabCodexAdapter",
@@ -97,6 +109,7 @@ def create_mcp(
             "Static-tool adapter for connecting Codex to a Google Colab browser "
             "session. Call colab_connect first, then use the colab_* tools."
         ),
+        auth=auth,
     )
 
     @mcp.tool()
@@ -448,17 +461,60 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STATE_FILE,
         help="file where adapter startup state is written",
     )
+    parser.add_argument(
+        "--broker-port",
+        type=int,
+        default=int(os.environ.get("COLAB_CODEX_BROKER_PORT", DEFAULT_BROKER_PORT)),
+        help="loopback port used by the shared multi-agent broker",
+    )
+    parser.add_argument(
+        "--broker-state-file",
+        type=Path,
+        default=DEFAULT_BROKER_STATE_FILE,
+        help="private shared-broker endpoint and token state",
+    )
+    parser.add_argument(
+        "--broker-lock-file",
+        type=Path,
+        default=DEFAULT_BROKER_LOCK_FILE,
+        help="process ownership lock for the shared broker",
+    )
     return parser.parse_args()
+
+
+async def _run_proxy(state: BrokerState) -> None:
+    proxy = FastMCP.as_proxy(
+        Client(state.endpoint, auth=state.token, timeout=1200.0),
+        name="ColabCodexAdapter",
+    )
+    await proxy.run_async(show_banner=False)
 
 
 async def main_async() -> None:
     args = parse_args()
     log_file = init_logger(args.log)
     started_at = time.time()
+    coordinator = BrokerCoordinator(
+        host=DEFAULT_BROKER_HOST,
+        port=args.broker_port,
+        state_file=args.broker_state_file,
+        lock_file=args.broker_lock_file,
+    )
+    broker_state = await coordinator.claim()
+    if not coordinator.is_owner:
+        logging.info(
+            "Using shared Colab broker owned by pid %s", broker_state.owner_pid
+        )
+        await _run_proxy(broker_state)
+        return
+
     runtime_info = {
         "adapter_version": __version__,
         "adapter_pid": os.getpid(),
         "adapter_started_at": started_at,
+        "broker_owner": True,
+        "broker_pid": os.getpid(),
+        "broker_endpoint": broker_state.endpoint,
         "log_dir": str(args.log),
         "log_file": str(log_file),
         "pid_file": str(args.pid_file),
@@ -467,11 +523,35 @@ async def main_async() -> None:
     write_pid(args.pid_file, os.getpid())
     write_state(args.state_file, {**runtime_info, "state": "starting"})
     manager = ColabSessionManager()
-    mcp = create_mcp(manager, runtime_info)
+    jobs = ColabJobManager(manager)
+    verifier = StaticTokenVerifier(
+        {
+            broker_state.token: {
+                "client_id": "colab-codex-adapter",
+                "scopes": [],
+            }
+        }
+    )
+    mcp = create_mcp(manager, runtime_info, job_manager=jobs, auth=verifier)
+    broker_task: asyncio.Task[None] | None = None
     try:
         await manager.start()
+        broker_task = asyncio.create_task(
+            mcp.run_http_async(
+                show_banner=False,
+                host=DEFAULT_BROKER_HOST,
+                port=args.broker_port,
+                log_level="critical",
+                uvicorn_config={"access_log": False, "log_config": None},
+                json_response=True,
+                stateless_http=True,
+            ),
+            name="colab-shared-broker",
+        )
+        await coordinator.wait_until_healthy(broker_state, broker_task)
+        coordinator.publish(broker_state)
         write_state(args.state_file, {**runtime_info, "state": "running"})
-        await mcp.run_async()
+        await _run_proxy(broker_state)
     except Exception as exc:
         logging.exception("Colab Codex adapter exited with an unhandled exception")
         write_state(
@@ -485,7 +565,13 @@ async def main_async() -> None:
         )
         raise
     finally:
+        if broker_task is not None:
+            broker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await broker_task
+        await jobs.close()
         await manager.close()
+        coordinator.release(broker_state)
 
 
 def main() -> None:

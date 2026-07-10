@@ -12,6 +12,7 @@ DEFAULT_RUNTIME_DIR = Path("/tmp/colab-codex-adapter")
 DEFAULT_LOG_DIR = DEFAULT_RUNTIME_DIR / "logs"
 DEFAULT_PID_FILE = DEFAULT_RUNTIME_DIR / "adapter.pid"
 DEFAULT_STATE_FILE = DEFAULT_RUNTIME_DIR / "adapter-state.json"
+DEFAULT_BROKER_STATE_FILE = DEFAULT_RUNTIME_DIR / "broker.json"
 
 
 def pid_is_running(pid: int) -> bool:
@@ -67,7 +68,9 @@ def adapter_info(
 
 
 def doctor(
-    pid_file: Path = DEFAULT_PID_FILE, state_file: Path = DEFAULT_STATE_FILE
+    pid_file: Path = DEFAULT_PID_FILE,
+    state_file: Path = DEFAULT_STATE_FILE,
+    broker_state_file: Path = DEFAULT_BROKER_STATE_FILE,
 ) -> dict[str, Any]:
     pid_text: str | None = None
     pid: int | None = None
@@ -78,6 +81,9 @@ def doctor(
         pass
 
     state = read_json(state_file)
+    broker_state = read_json(broker_state_file)
+    if broker_state is not None:
+        broker_state.pop("token", None)
     running = pid_is_running(pid) if pid is not None else False
     return {
         "pid_file": str(pid_file),
@@ -86,12 +92,23 @@ def doctor(
         "pid_file_raw": pid_text,
         "adapter_process_running": running,
         "state": state,
-        "diagnosis": diagnosis(running, state),
+        "broker_state_file": str(broker_state_file),
+        "broker": broker_state,
+        "diagnosis": diagnosis(running, state, broker_state),
     }
 
 
-def diagnosis(running: bool, state: dict[str, Any] | None) -> str:
+def diagnosis(
+    running: bool,
+    state: dict[str, Any] | None,
+    broker_state: dict[str, Any] | None = None,
+) -> str:
     if running:
+        if broker_state is None:
+            return (
+                "adapter_process_running_without_shared_broker; restart Codex "
+                "to load the multi-agent connector"
+            )
         return "adapter_process_running"
     if state:
         return (
