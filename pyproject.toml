@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 colab-codex-adapter = "colab_codex_adapter.server:main"
 colab-codex-doctor = "colab_codex_adapter.diagnostics:main"
+colab-codex-agent-init = "colab_codex_adapter.agent_setup:main"
 
 [build-system]
 requires = ["setuptools>=69"]
