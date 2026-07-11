@@ -51,6 +51,7 @@ from .private_state import read_private_json, write_private_json
 from .jobs import (
     DEFAULT_CELL_METADATA_PAGE_SIZE,
     DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+    DEFAULT_KERNEL_PROBE_TIMEOUT_SECONDS,
     DEFAULT_WAIT_TIMEOUT_SECONDS,
     MAX_WAIT_TIMEOUT_SECONDS,
     ColabJobManager,
@@ -128,9 +129,11 @@ async def _get_cells(
 ) -> list[dict[str, Any]]:
     arguments: dict[str, Any] = {"includeOutputs": include_outputs}
     if start is not None:
-        arguments["start"] = start
+        arguments["cellIndexStart"] = start
     if end is not None:
-        arguments["end"] = end
+        if start is not None and end <= start:
+            raise ValueError("cell metadata end must be greater than start")
+        arguments["cellIndexEnd"] = end - 1
     result = await session.call_tool("get_cells", arguments)
     cells = _result_data(result).get("cells", [])
     if not isinstance(cells, list):
@@ -318,7 +321,19 @@ def _wire_job_transitions(
     async def reconcile(expected_generation: int) -> None:
         while session.runtime_generation == expected_generation:
             try:
-                await jobs.reconcile_detached()
+                probe_kernel = getattr(jobs, "probe_kernel", None)
+                readiness = (
+                    await probe_kernel(timeout=DEFAULT_KERNEL_PROBE_TIMEOUT_SECONDS)
+                    if probe_kernel is not None
+                    else {"kernel_execution_ready": True}
+                )
+                if readiness["kernel_execution_ready"] is True:
+                    await jobs.reconcile_detached()
+                else:
+                    logging.warning(
+                        "Colab kernel readiness probe failed generation=%s",
+                        expected_generation,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -331,6 +346,9 @@ def _wire_job_transitions(
     async def listener(transition: ConnectionTransition) -> None:
         nonlocal reconciliation_task
         if transition.kind in {"browser_disconnected", "reset"}:
+            mark_kernel_unknown = getattr(jobs, "mark_kernel_unknown", None)
+            if mark_kernel_unknown is not None:
+                mark_kernel_unknown("Colab browser transport is not connected")
             if reconciliation_task is not None and not reconciliation_task.done():
                 reconciliation_task.cancel()
                 await asyncio.gather(
@@ -405,6 +423,23 @@ def create_mcp(
             artifact_store=artifacts,
         )
 
+    def status_data(status: Any) -> dict[str, Any]:
+        readiness = getattr(jobs, "kernel_readiness", lambda: {})()
+        return {
+            **status.__dict__,
+            "frontend_mcp_ready": status.remote_mcp_initialized,
+            **readiness,
+        }
+
+    async def connection_data() -> dict[str, Any]:
+        connection = await session.connection_url()
+        readiness = getattr(jobs, "kernel_readiness", lambda: {})()
+        return {
+            **connection,
+            "frontend_mcp_ready": connection["runtime_alive"],
+            **readiness,
+        }
+
     @mcp.tool()
     async def colab_connect(
         wait_seconds: float = 60.0, open_browser: bool = False
@@ -415,18 +450,18 @@ def create_mcp(
         )
         if browser_state_file is not None:
             _persist_session(session, browser_state_file)
-        return response(status.__dict__, "Colab connection status")
+        return response(status_data(status), "Colab connection status")
 
     @mcp.tool()
     async def colab_status(include_remote_tools: bool = False) -> ToolResult:
         """Return current browser connection state and the connection URL."""
         status = await session.status(include_remote_tools=include_remote_tools)
-        return response(status.__dict__, "Colab status")
+        return response(status_data(status), "Colab status")
 
     @mcp.tool()
     async def colab_adapter_info() -> ToolResult:
         """Return shared service, transport, and connection metadata."""
-        connection = await session.connection_url()
+        connection = await connection_data()
         pid_file = runtime_info.get("pid_file")
         state_file = runtime_info.get("state_file")
         data = adapter_info(
@@ -447,7 +482,7 @@ def create_mcp(
     @mcp.tool()
     async def colab_connection_url() -> ToolResult:
         """Return the current Colab connection URL without remote calls."""
-        return response(await session.connection_url(), "Colab connection URL")
+        return response(await connection_data(), "Colab connection URL")
 
     @mcp.tool()
     async def colab_reset_connection(
@@ -460,7 +495,7 @@ def create_mcp(
         )
         if browser_state_file is not None:
             _persist_session(session, browser_state_file)
-        return response(status.__dict__, "Colab connection reset")
+        return response(status_data(status), "Colab connection reset")
 
     @mcp.tool()
     async def colab_list_remote_tools() -> ToolResult:

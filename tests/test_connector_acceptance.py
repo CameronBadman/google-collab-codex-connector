@@ -269,11 +269,13 @@ class PagedRemoteSession(RecordingRemoteSession):
         self.calls.append((name, arguments))
         assert name == "get_cells"
         assert arguments.get("includeOutputs") is False
-        assert isinstance(arguments.get("start"), int)
-        assert isinstance(arguments.get("end"), int)
+        assert isinstance(arguments.get("cellIndexStart"), int)
+        assert isinstance(arguments.get("cellIndexEnd"), int)
         cells = [
             {key: value for key, value in cell.items() if key != "outputs"}
-            for cell in self.cells[arguments["start"] : arguments["end"]]
+            for cell in self.cells[
+                arguments["cellIndexStart"] : arguments["cellIndexEnd"] + 1
+            ]
         ]
         return McpCallToolResult(
             content=[TextContent(type="text", text=json.dumps({"cells": cells}))],
@@ -300,9 +302,18 @@ async def test_notebook_metadata_is_fetched_in_bounded_pages() -> None:
     assert len(result.structured_content["cells"]) == 17
     assert all("outputs" not in cell for cell in result.structured_content["cells"])
     assert session.calls == [
-        ("get_cells", {"includeOutputs": False, "start": 0, "end": 8}),
-        ("get_cells", {"includeOutputs": False, "start": 8, "end": 16}),
-        ("get_cells", {"includeOutputs": False, "start": 16, "end": 24}),
+        (
+            "get_cells",
+            {"includeOutputs": False, "cellIndexStart": 0, "cellIndexEnd": 7},
+        ),
+        (
+            "get_cells",
+            {"includeOutputs": False, "cellIndexStart": 8, "cellIndexEnd": 15},
+        ),
+        (
+            "get_cells",
+            {"includeOutputs": False, "cellIndexStart": 16, "cellIndexEnd": 23},
+        ),
     ]
 
 

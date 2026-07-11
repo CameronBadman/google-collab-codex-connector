@@ -6,7 +6,7 @@ notebooks through the browser-side Colab MCP frontend. It exposes a stable
 service owns the notebook session for the local user; parent agents and native
 Codex workers reach that service through disposable stdio shims.
 
-> **Project status:** experimental. Version `0.3.0` targets one trusted local
+> **Project status:** experimental. Version `0.3.1` targets one trusted local
 > user, one active Colab browser tab, and one notebook runtime. It is not a
 > hosted or multi-tenant service.
 
@@ -22,6 +22,8 @@ Codex workers reach that service through disposable stdio shims.
   opens a surprise browser tab.
 - Job status checks never download accumulated notebook outputs. Timed waits
   use a local completion event and make no Colab request on timeout.
+- Frontend MCP readiness and Python-kernel execution readiness are reported
+  separately. Kernel readiness requires a matching nonce from executed Python.
 - Reconnected jobs are rechecked through bounded runtime markers every 15
   seconds by default until they become terminal.
 - Final MCP results are capped at 256 KiB by default. Larger data is exposed by
@@ -205,8 +207,14 @@ only normal source of final target-cell output. While a job runs:
 Completed executions release their notebook cell back to a connector-owned
 pool. The pool defaults to 16 cells, bounds persistent wrapper source growth,
 and rejects additional concurrent work when every pooled cell is still owned by
-an unfinished job. The reusable recovery-probe cell is persisted across broker
-replacement rather than appended again.
+an unfinished job. Pool and probe cell IDs are restored only for the same
+connection identity and are validated against connector-owned source before
+reuse. A reset invalidates all notebook-scoped cell state.
+
+A tracked execution becomes terminal only after a matching job-specific
+manifest or an explicit frontend cell error. Missing, malformed, empty, or
+unrelated `run_code_cell` output leaves the job detached and ambiguous; it is
+never converted to success and user code is never replayed.
 
 A browser disconnect never causes `run_code_cell` to be replayed. The job moves
 to `tracking_state="detached"`, with `execution_alive=null` because execution
@@ -231,6 +239,9 @@ Useful job fields include:
 - `execution_alive`: `true`, `false`, or `null` when Colab execution is unknown.
 - `output_bytes`, `output_excerpt_bytes`, and `output_truncated`.
 - `output_artifact` and `output_unavailable_reason`.
+- `remote_response_bytes`, `remote_output_count`, and
+  `captured_runtime_output_bytes`.
+- `terminal_manifest_found` and `completion_source`.
 - `wait_timed_out` and `waited_seconds` on wait responses.
 
 ## Bounded Results and Artifacts
@@ -301,6 +312,7 @@ The next adapter request starts a replacement.
 | `COLAB_CODEX_MAX_ARTIFACT_TOTAL_BYTES` | `268435456` | Local and Colab-runtime artifact quota. |
 | `COLAB_CODEX_ARTIFACT_TTL_SECONDS` | `86400` | Local and Colab-runtime artifact lifetime. |
 | `COLAB_CODEX_ARTIFACT_PROBE_TIMEOUT_SECONDS` | `30` | Maximum time a runtime artifact read waits behind a busy kernel. |
+| `COLAB_CODEX_KERNEL_PROBE_TIMEOUT_SECONDS` | `30` | Maximum time allowed for the Python-kernel readiness nonce probe. |
 
 Limits must remain finite. Raising the WebSocket ceiling is not a substitute
 for keeping tool and job responses bounded.
@@ -321,6 +333,7 @@ distinguishes:
 - an optional per-shim PID only when explicit per-shim diagnostic paths were
   supplied; no shim is treated as the canonical connector process;
 - browser and runtime liveness reported by connector tools;
+- frontend MCP readiness separately from nonce-proven kernel execution readiness;
 - the protected state paths needed for local troubleshooting.
 
 WebSocket diagnostics include the last close code and sanitized reason, browser

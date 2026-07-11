@@ -23,12 +23,26 @@ class FakeSession:
         run_outputs: list[dict[str, Any]] | None = None,
         run_gate: asyncio.Event | None = None,
         run_error: Exception | None = None,
+        run_data: dict[str, Any] | None = None,
+        connection_id: str = "fake-connection",
+        manifest_output_excerpt: str = "ok\n",
+        manifest_output_bytes: int | None = None,
+        manifest_artifact_size: int = 0,
+        manifest_state: str = "finished",
+        manifest_error: str | None = None,
     ) -> None:
         self.cells: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.run_outputs = run_outputs
         self.run_gate = run_gate
         self.run_error = run_error
+        self.run_data = run_data
+        self.connection_id = connection_id
+        self.manifest_output_excerpt = manifest_output_excerpt
+        self.manifest_output_bytes = manifest_output_bytes
+        self.manifest_artifact_size = manifest_artifact_size
+        self.manifest_state = manifest_state
+        self.manifest_error = manifest_error
 
     async def list_tools(self) -> list[Tool]:
         return [
@@ -54,10 +68,13 @@ class FakeSession:
                     {key: value for key, value in cell.items() if key != "outputs"}
                     for cell in self.cells
                 ]
-            start = arguments.get("start")
-            end = arguments.get("end")
+            start = arguments.get("cellIndexStart")
+            end = arguments.get("cellIndexEnd")
             if isinstance(start, int) or isinstance(end, int):
-                cells = cells[start if isinstance(start, int) else 0 : end]
+                cells = cells[
+                    start if isinstance(start, int) else 0 :
+                    end + 1 if isinstance(end, int) else None
+                ]
             return result({"cells": cells})
         if name == "add_code_cell":
             cell_id = f"cell-{len(self.cells)}"
@@ -80,17 +97,62 @@ class FakeSession:
                 await self.run_gate.wait()
             if self.run_error is not None:
                 raise self.run_error
+            if self.run_data is not None:
+                return result(self.run_data)
             for cell in self.cells:
                 if cell["id"] == arguments["cellId"]:
                     if self.run_outputs is None:
-                        self.run_outputs = [
-                            {
-                                "output_type": "stream",
-                                "name": "stdout",
-                                "text": ["ok\n"],
+                        source = "".join(cell["source"])
+                        config_line = next(
+                            (
+                                line
+                                for line in source.splitlines()
+                                if line.strip().startswith("_cc_config = {")
+                            ),
+                            None,
+                        )
+                        if config_line is None:
+                            outputs = [
+                                {
+                                    "output_type": "stream",
+                                    "name": "stdout",
+                                    "text": ["ok\n"],
+                                }
+                            ]
+                        else:
+                            config = json.loads(config_line.split("=", 1)[1].strip())
+                            excerpt = self.manifest_output_excerpt
+                            output_bytes = (
+                                self.manifest_output_bytes
+                                if self.manifest_output_bytes is not None
+                                else len(excerpt.encode("utf-8"))
+                            )
+                            manifest = {
+                                "job_id": config["job_id"],
+                                "state": self.manifest_state,
+                                "error": self.manifest_error,
+                                "output_bytes": output_bytes,
+                                "output_excerpt": excerpt,
+                                "output_truncated": output_bytes
+                                > len(excerpt.encode("utf-8")),
+                                "artifact_size_bytes": self.manifest_artifact_size,
+                                "artifact_sha256": "a" * 64,
+                                "artifact_truncated": False,
                             }
-                        ]
-                    cell["outputs"] = self.run_outputs
+                            outputs = [
+                                {
+                                    "output_type": "stream",
+                                    "name": "stdout",
+                                    "text": [
+                                        jobs_module._JOB_SENTINEL
+                                        + json.dumps(manifest, separators=(",", ":"))
+                                        + "\n"
+                                    ],
+                                }
+                            ]
+                    else:
+                        outputs = self.run_outputs
+                    cell["outputs"] = outputs
                     return result({"outputs": cell["outputs"]})
         raise AssertionError(f"unexpected tool call: {name}")
 
@@ -186,11 +248,13 @@ async def test_job_start_counts_existing_cells_in_bounded_metadata_pages() -> No
     assert started["cell_index"] == 17
     page_calls = [args for name, args in session.calls if name == "get_cells"]
     assert page_calls[:3] == [
-        {"includeOutputs": False, "start": 0, "end": 8},
-        {"includeOutputs": False, "start": 8, "end": 16},
-        {"includeOutputs": False, "start": 16, "end": 24},
+        {"includeOutputs": False, "cellIndexStart": 0, "cellIndexEnd": 7},
+        {"includeOutputs": False, "cellIndexStart": 8, "cellIndexEnd": 15},
+        {"includeOutputs": False, "cellIndexStart": 16, "cellIndexEnd": 23},
     ]
-    assert all("start" in args and "end" in args for args in page_calls)
+    assert all(
+        "cellIndexStart" in args and "cellIndexEnd" in args for args in page_calls
+    )
     gate.set()
     await manager.wait(started["job_id"], timeout_seconds=1.0)
 
@@ -250,10 +314,12 @@ async def test_status_finds_reordered_job_beyond_first_metadata_page() -> None:
     get_cells = [args for name, args in session.calls if name == "get_cells"]
     assert get_cells[0] == {
         "includeOutputs": False,
-        "start": 17,
-        "end": 18,
+        "cellIndexStart": 17,
+        "cellIndexEnd": 17,
     }
-    assert all("start" in args and "end" in args for args in get_cells)
+    assert all(
+        "cellIndexStart" in args and "cellIndexEnd" in args for args in get_cells
+    )
     gate.set()
     await manager.wait(started["job_id"], timeout_seconds=1.0)
 
@@ -359,6 +425,82 @@ async def test_job_cell_pool_survives_manager_recovery(tmp_path: Path) -> None:
     assert sum(name == "update_cell" for name, _ in session.calls) == 1
 
 
+async def test_stale_pooled_cell_is_not_reused_in_a_new_notebook(
+    tmp_path: Path,
+) -> None:
+    session = FakeSession()
+    journal = tmp_path / "jobs.json"
+    first_manager = ColabJobManager(session, journal_path=journal)  # type: ignore[arg-type]
+    first = await first_manager.start_python("first()")
+    await first_manager.wait(first["job_id"], timeout_seconds=1.0)
+    stale_cell_id = first["cell_id"]
+
+    session.cells = [
+        {
+            "id": "current-notebook-cell",
+            "cell_type": "code",
+            "source": ["pass"],
+            "outputs": [],
+        }
+    ]
+    session.calls.clear()
+    recovered = ColabJobManager(session, journal_path=journal)  # type: ignore[arg-type]
+    second = await recovered.start_python("second()")
+    await recovered.wait(second["job_id"], timeout_seconds=1.0)
+
+    assert second["cell_id"] != stale_cell_id
+    assert not any(
+        name == "update_cell" and args["cellId"] == stale_cell_id
+        for name, args in session.calls
+    )
+
+
+def test_cell_pool_journal_is_scoped_to_connection_id(tmp_path: Path) -> None:
+    journal = tmp_path / "jobs.json"
+    first = ColabJobManager(
+        FakeSession(connection_id="notebook-a"),  # type: ignore[arg-type]
+        journal_path=journal,
+    )
+    first._job_cells["cell-from-a"] = 4
+    first._probe_cell_id = "probe-from-a"
+    first._persist_journal()
+
+    recovered = ColabJobManager(
+        FakeSession(connection_id="notebook-b"),  # type: ignore[arg-type]
+        journal_path=journal,
+    )
+
+    assert recovered._job_cells == {}
+    assert recovered._probe_cell_id is None
+
+
+async def test_legacy_finished_journal_without_manifest_proof_is_invalidated(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "jobs.json"
+    session = FakeSession()
+    first = ColabJobManager(session, journal_path=journal)  # type: ignore[arg-type]
+    started = await first.start_python("x = 1")
+    await first.wait(started["job_id"], timeout_seconds=1.0)
+    data = json.loads(journal.read_text(encoding="utf-8"))
+    data["version"] = 2
+    data.pop("connection_id", None)
+    for record in data["jobs"]:
+        record.pop("terminal_manifest_found", None)
+        record.pop("completion_source", None)
+    journal.write_text(json.dumps(data), encoding="utf-8")
+
+    recovered = ColabJobManager(session, journal_path=journal)  # type: ignore[arg-type]
+    status = await recovered.status(started["job_id"])
+
+    assert status["state"] == "interrupted"
+    assert status["terminal_manifest_found"] is False
+    assert "lacked terminal-manifest proof" in status["output_unavailable_reason"]
+    migrated = json.loads(journal.read_text(encoding="utf-8"))
+    assert migrated["version"] == 3
+    assert migrated["connection_id"] == session.connection_id
+
+
 async def test_lost_job_cell_add_response_recovers_without_pool_growth() -> None:
     session = AmbiguousAddSession()
     manager = ColabJobManager(
@@ -427,7 +569,7 @@ async def test_execution_timeout_has_a_finite_upper_bound() -> None:
 async def test_wait_job_times_out_without_cancelling_execution() -> None:
     gate = asyncio.Event()
     manager = ColabJobManager(
-        FakeSession(run_outputs=[], run_gate=gate)  # type: ignore[arg-type]
+        FakeSession(run_gate=gate)  # type: ignore[arg-type]
     )
     started = await manager.start_python("while True: pass")
 
@@ -443,7 +585,7 @@ async def test_wait_job_times_out_without_cancelling_execution() -> None:
     gate.set()
     finished = await manager.wait(started["job_id"], timeout_seconds=1.0)
     assert finished["state"] == "finished"
-    assert finished["outputs"] == []
+    assert finished["terminal_manifest_found"] is True
 
 
 async def test_wait_returns_as_soon_as_completion_event_fires() -> None:
@@ -483,7 +625,7 @@ async def test_wait_timeout_bounds_are_enforced() -> None:
             raise AssertionError(f"timeout {invalid} should have been rejected")
 
 
-async def test_empty_outputs_mark_completed_execution_finished() -> None:
+async def test_empty_outputs_leave_execution_ambiguous() -> None:
     manager = ColabJobManager(
         FakeSession(run_outputs=[])  # type: ignore[arg-type]
     )
@@ -491,8 +633,62 @@ async def test_empty_outputs_mark_completed_execution_finished() -> None:
     started = await manager.start_python("x = 1")
     finished = await manager.wait(started["job_id"], timeout_seconds=1.0)
 
-    assert finished["state"] == "finished"
+    assert finished["state"] == "running"
+    assert finished["tracking_state"] == "detached"
+    assert finished["completion_source"] is None
+    assert finished["terminal_manifest_found"] is False
+    assert finished["captured_runtime_output_bytes"] is None
+    assert finished["remote_output_count"] == 0
     assert finished["outputs"] == []
+
+
+@pytest.mark.parametrize(
+    "run_data",
+    [
+        {},
+        {"outputs": None},
+        {"outputs": "not-a-list"},
+        {"outputs": []},
+        {
+            "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": ["unproven"]}
+            ]
+        },
+    ],
+)
+async def test_unproven_execution_responses_never_finish(
+    run_data: dict[str, Any],
+) -> None:
+    manager = ColabJobManager(
+        FakeSession(run_data=run_data)  # type: ignore[arg-type]
+    )
+
+    started = await manager.start_python("x = 1")
+    result_value = await manager.wait(started["job_id"], timeout_seconds=1.0)
+
+    assert result_value["state"] == "running"
+    assert result_value["tracking_state"] == "detached"
+    assert result_value["terminal_manifest_found"] is False
+    assert result_value["completion_source"] is None
+
+
+async def test_controlled_exception_finishes_through_matching_manifest() -> None:
+    manager = ColabJobManager(
+        FakeSession(
+            manifest_output_excerpt="before failure\ntraceback\n",
+            manifest_state="error",
+            manifest_error="RuntimeError: controlled",
+        )  # type: ignore[arg-type]
+    )
+
+    started = await manager.start_python("raise RuntimeError('controlled')")
+    finished = await manager.wait(started["job_id"], timeout_seconds=1.0)
+
+    assert finished["state"] == "error"
+    assert finished["error"] == "RuntimeError: controlled"
+    assert "before failure" in finished["outputs"][0]["text"][0]
+    assert finished["terminal_manifest_found"] is True
+    assert finished["completion_source"] == "terminal_manifest"
 
 
 async def test_error_output_marks_job_error() -> None:
@@ -527,6 +723,21 @@ async def test_mark_stale_marks_running_jobs_only() -> None:
     status = await manager.status(started["job_id"])
     assert status["state"] == "stale"
     assert status["error"] == "reset"
+
+
+async def test_mark_stale_invalidates_notebook_scoped_cell_state() -> None:
+    manager = ColabJobManager(FakeSession())  # type: ignore[arg-type]
+    manager._job_cells["job-cell"] = 1
+    manager._probe_cell_id = "probe-cell"
+    manager._pending_job_cell_sha256 = "a" * 64
+    manager._pending_probe_cell_sha256 = "b" * 64
+
+    await manager.mark_stale("reset")
+
+    assert manager._job_cells == {}
+    assert manager._probe_cell_id is None
+    assert manager._pending_job_cell_sha256 is None
+    assert manager._pending_probe_cell_sha256 is None
 
 
 async def test_execution_timeout_marks_job_timed_out() -> None:
@@ -583,8 +794,8 @@ async def test_status_never_downloads_accumulated_notebook_outputs() -> None:
     assert get_cells_calls
     assert all(args.get("includeOutputs") is False for args in get_cells_calls)
     status_call = get_cells_calls[-1]
-    assert status_call["start"] == started["cell_index"]
-    assert status_call["end"] == started["cell_index"] + 1
+    assert status_call["cellIndexStart"] == started["cell_index"]
+    assert status_call["cellIndexEnd"] == started["cell_index"]
     assert len(json.dumps(status).encode("utf-8")) < 16 * 1024
     gate.set()
     await manager.wait(started["job_id"], timeout_seconds=1.0)
@@ -594,10 +805,11 @@ async def test_large_target_output_is_bounded_and_stored_as_artifact(
     tmp_path: Path,
 ) -> None:
     large_text = "training-log\n" * 180_000
+    large_bytes = len(large_text.encode("utf-8"))
     session = FakeSession(
-        run_outputs=[
-            {"output_type": "stream", "name": "stdout", "text": [large_text]}
-        ]
+        manifest_output_excerpt=large_text[: 24 * 1024],
+        manifest_output_bytes=large_bytes,
+        manifest_artifact_size=large_bytes,
     )
     store = ArtifactStore(tmp_path / "artifacts")
     manager = ColabJobManager(
@@ -610,32 +822,23 @@ async def test_large_target_output_is_bounded_and_stored_as_artifact(
     finished = await manager.wait(started["job_id"], timeout_seconds=1.0)
 
     assert finished["state"] == "finished"
-    assert finished["output_bytes"] > 2 * 1024 * 1024
+    assert finished["output_bytes"] == large_bytes
     assert finished["output_truncated"] is True
-    assert finished["output_artifact"]["storage"] == "broker"
+    assert finished["output_artifact"]["storage"] == "colab_runtime"
     assert len(json.dumps(finished).encode("utf-8")) < 64 * 1024
-    chunk = await manager.read_artifact(
-        finished["output_artifact"]["artifact_id"], limit_bytes=1024
-    )
-    assert chunk["next_offset"] == 1024
-    assert chunk["eof"] is False
 
 
 async def test_large_binary_display_is_not_echoed_or_duplicated(
     tmp_path: Path,
 ) -> None:
-    binary_payload = "A" * (2 * 1024 * 1024)
+    binary_payload_bytes = 2 * 1024 * 1024
     manager = ColabJobManager(
         FakeSession(
-            run_outputs=[
-                {
-                    "output_type": "display_data",
-                    "data": {
-                        "text/plain": "plot",
-                        "image/png": binary_payload,
-                    },
-                }
-            ]
+            manifest_output_excerpt=(
+                "plot\n[binary/rich display omitted: image/png]\n"
+            ),
+            manifest_output_bytes=binary_payload_bytes,
+            manifest_artifact_size=binary_payload_bytes,
         ),  # type: ignore[arg-type]
         artifact_store=ArtifactStore(tmp_path / "artifacts"),
         output_excerpt_bytes=16 * 1024,
@@ -646,7 +849,6 @@ async def test_large_binary_display_is_not_echoed_or_duplicated(
     serialized = json.dumps(finished)
 
     assert "[binary/rich display omitted: image/png]" in serialized
-    assert binary_payload not in serialized
     assert serialized.count("plot") == 1
     assert finished["output_artifact"] is not None
 
@@ -1345,12 +1547,87 @@ async def test_recovery_probe_append_index_uses_bounded_metadata_pages() -> None
 
     page_calls = [args for name, args in session.calls if name == "get_cells"]
     assert page_calls == [
-        {"includeOutputs": False, "start": 0, "end": 8},
-        {"includeOutputs": False, "start": 8, "end": 16},
-        {"includeOutputs": False, "start": 16, "end": 24},
+        {"includeOutputs": False, "cellIndexStart": 0, "cellIndexEnd": 7},
+        {"includeOutputs": False, "cellIndexStart": 8, "cellIndexEnd": 15},
+        {"includeOutputs": False, "cellIndexStart": 16, "cellIndexEnd": 23},
     ]
     add_call = next(args for name, args in session.calls if name == "add_code_cell")
     assert add_call["cellIndex"] == 17
+
+
+async def test_reconciliation_probe_requires_matching_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ColabJobManager(FakeSession())  # type: ignore[arg-type]
+    now = time.time()
+    job = ColabJob(
+        job_id="a" * 32,
+        cell_id="cell",
+        cell_index=0,
+        code_bytes=1,
+        code_sha256="b" * 64,
+        state="running",
+        tracking_state="detached",
+        started_at=now,
+        updated_at=now,
+        execution_timeout_seconds=60,
+        runtime_marker_path="/tmp/marker",
+        runtime_output_path="/tmp/output",
+        runtime_artifact_id="c" * 32,
+    )
+
+    async def empty_probe(code: str, *, timeout: float) -> list[Any]:
+        del code, timeout
+        return []
+
+    monkeypatch.setattr(manager, "_append_and_run_probe", empty_probe)
+
+    with pytest.raises(RuntimeError, match="reconciliation sentinel"):
+        await manager._read_runtime_markers([job])
+
+
+async def test_kernel_readiness_requires_matching_nonce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ColabJobManager(FakeSession())  # type: ignore[arg-type]
+
+    class FixedUuid:
+        hex = "kernel-nonce"
+
+    monkeypatch.setattr(jobs_module.uuid, "uuid4", lambda: FixedUuid())
+
+    async def proven_probe(code: str, *, timeout: float) -> list[Any]:
+        del code, timeout
+        return [
+            {
+                "output_type": "stream",
+                "name": "stdout",
+                "text": [
+                    jobs_module._KERNEL_PROBE_SENTINEL
+                    + '{"nonce":"kernel-nonce"}\n'
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(manager, "_append_and_run_probe", proven_probe)
+
+    readiness = await manager.probe_kernel()
+
+    assert readiness["kernel_execution_ready"] is True
+    assert readiness["kernel_probe_at"] is not None
+    assert readiness["kernel_probe_latency_ms"] is not None
+    assert readiness["kernel_probe_error"] is None
+
+
+async def test_kernel_readiness_records_failed_execution_probe() -> None:
+    manager = ColabJobManager(
+        FakeSession(run_outputs=[])  # type: ignore[arg-type]
+    )
+
+    readiness = await manager.probe_kernel(timeout=1)
+
+    assert readiness["kernel_execution_ready"] is False
+    assert "kernel sentinel" in readiness["kernel_probe_error"]
 
 
 async def test_probe_timeout_includes_waiting_for_probe_lock() -> None:

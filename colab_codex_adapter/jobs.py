@@ -86,11 +86,24 @@ if (
     raise ValueError(
         "COLAB_CODEX_ARTIFACT_PROBE_TIMEOUT_SECONDS must be between 1 and 300"
     )
+DEFAULT_KERNEL_PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get("COLAB_CODEX_KERNEL_PROBE_TIMEOUT_SECONDS", 30)
+)
+if (
+    not math.isfinite(DEFAULT_KERNEL_PROBE_TIMEOUT_SECONDS)
+    or not 1 <= DEFAULT_KERNEL_PROBE_TIMEOUT_SECONDS <= 300
+):
+    raise ValueError(
+        "COLAB_CODEX_KERNEL_PROBE_TIMEOUT_SECONDS must be between 1 and 300"
+    )
 RECONCILIATION_BATCH_SIZE = 64
 _JOB_SENTINEL = "__COLAB_CODEX_JOB__"
 _RECONCILE_SENTINEL = "__COLAB_CODEX_RECONCILE__"
 _ARTIFACT_SENTINEL = "__COLAB_CODEX_ARTIFACT__"
+_KERNEL_PROBE_SENTINEL = "__COLAB_CODEX_KERNEL_PROBE__"
+_PROBE_CELL_MARKER = "# colab-codex-managed-probe"
 _UNKNOWN_JOB_MESSAGE = "Unknown Colab job id"
+_MISSING = object()
 _TERMINAL_STATES = {
     "finished",
     "error",
@@ -258,6 +271,11 @@ class ColabJob:
     output_unavailable_reason: str | None = None
     error: str | None = None
     tracking_error: str | None = None
+    remote_response_bytes: int = 0
+    remote_output_count: int | None = None
+    captured_runtime_output_bytes: int | None = None
+    terminal_manifest_found: bool = False
+    completion_source: str | None = None
     runtime_marker_path: str = field(default="", repr=False)
     runtime_output_path: str = field(default="", repr=False)
     runtime_artifact_id: str = field(default="", repr=False)
@@ -352,6 +370,10 @@ class ColabJobManager:
         self._reconciliation_attempts: dict[str, object] = {}
         self._deferred_task_persistence: set[str] = set()
         self._lock = asyncio.Lock()
+        self._kernel_execution_ready: bool | None = None
+        self._kernel_probe_at: float | None = None
+        self._kernel_probe_latency_ms: float | None = None
+        self._kernel_probe_error: str | None = None
         # Lightweight fake sessions used by callers/tests should not unexpectedly
         # share the production journal unless an explicit non-default path is set.
         if (
@@ -362,6 +384,10 @@ class ColabJobManager:
             journal_path = None
         self.journal_path = Path(journal_path) if journal_path is not None else None
         self._load_journal()
+
+    def _session_connection_id(self) -> str | None:
+        value = getattr(self.session, "connection_id", None)
+        return value if isinstance(value, str) and value else None
 
     def _journal_record(self, job: ColabJob) -> dict[str, Any]:
         artifact = job.output_artifact
@@ -396,6 +422,11 @@ class ColabJobManager:
             "output_excerpt_bytes": job.output_excerpt_bytes,
             "output_truncated": job.output_truncated,
             "output_artifact": artifact,
+            "remote_response_bytes": job.remote_response_bytes,
+            "remote_output_count": job.remote_output_count,
+            "captured_runtime_output_bytes": job.captured_runtime_output_bytes,
+            "terminal_manifest_found": job.terminal_manifest_found,
+            "completion_source": job.completion_source,
             "runtime_artifact_id": job.runtime_artifact_id,
         }
 
@@ -404,8 +435,9 @@ class ColabJobManager:
             return
         path = self.journal_path
         data = {
-            "version": 2,
+            "version": 3,
             "updated_at": time.time(),
+            "connection_id": self._session_connection_id(),
             "probe_cell_id": self._probe_cell_id,
             "pending_job_cell_sha256": self._pending_job_cell_sha256,
             "pending_probe_cell_sha256": self._pending_probe_cell_sha256,
@@ -458,6 +490,7 @@ class ColabJobManager:
         records = raw.get("jobs") if isinstance(raw, dict) else None
         if not isinstance(records, list):
             return
+        journal_needs_migration = raw.get("version") != 3
         for record in records[-MAX_JOURNAL_JOBS:]:
             job = self._restore_record(record)
             if job is None:
@@ -468,6 +501,19 @@ class ColabJobManager:
             self._completion_events[job.job_id] = event
             if job.output_artifact and job.output_artifact.get("storage") == "colab_runtime":
                 self._runtime_artifacts[job.runtime_artifact_id] = job.runtime_output_path
+            if job.state == "interrupted" and record.get("state") == "finished":
+                journal_needs_migration = True
+        journal_connection_id = raw.get("connection_id")
+        if (
+            raw.get("version") != 3
+            or not isinstance(journal_connection_id, str)
+            or journal_connection_id != self._session_connection_id()
+        ):
+            # Historical jobs are portable broker metadata. Notebook cell ids are
+            # not, so legacy or differently scoped journals must not restore them.
+            if journal_needs_migration:
+                self._persist_journal()
+            return
         probe_cell_id = raw.get("probe_cell_id")
         if isinstance(probe_cell_id, str) and 1 <= len(probe_cell_id) <= 256:
             self._probe_cell_id = probe_cell_id
@@ -492,13 +538,6 @@ class ColabJobManager:
                     and cell_index >= 0
                 ):
                     self._job_cells[cell_id] = cell_index
-        if not self._job_cells:
-            for job in reversed(list(self.jobs.values())):
-                if job.cell_id in self._job_cells:
-                    continue
-                self._job_cells[job.cell_id] = job.cell_index
-                if len(self._job_cells) >= self.max_job_cells:
-                    break
 
     def _restore_record(self, record: Any) -> ColabJob | None:
         if not isinstance(record, dict):
@@ -516,6 +555,12 @@ class ColabJobManager:
             return None
         try:
             state = str(record.get("state", "running"))
+            unproven_finished = state == "finished" and not (
+                record.get("terminal_manifest_found") is True
+                and record.get("completion_source") == "terminal_manifest"
+            )
+            if unproven_finished:
+                state = "interrupted"
             recoverable = state not in _TERMINAL_STATES or (
                 state == "timed_out"
                 and record.get("tracking_state") == "detached"
@@ -556,13 +601,38 @@ class ColabJobManager:
                     else None
                 ),
                 output_unavailable_reason=(
-                    "Output excerpt is unavailable after broker recovery"
-                    if int(record.get("output_excerpt_bytes", 0)) > 0
-                    else None
+                    "Legacy job completion lacked terminal-manifest proof"
+                    if unproven_finished
+                    else (
+                        "Output excerpt is unavailable after broker recovery"
+                        if int(record.get("output_excerpt_bytes", 0)) > 0
+                        else None
+                    )
                 ),
                 tracking_error=(
                     "Broker owner changed; awaiting runtime reconciliation"
                     if recoverable
+                    else None
+                ),
+                remote_response_bytes=max(
+                    0, int(record.get("remote_response_bytes", 0))
+                ),
+                remote_output_count=(
+                    max(0, int(record["remote_output_count"]))
+                    if record.get("remote_output_count") is not None
+                    else None
+                ),
+                captured_runtime_output_bytes=(
+                    max(0, int(record["captured_runtime_output_bytes"]))
+                    if record.get("captured_runtime_output_bytes") is not None
+                    else None
+                ),
+                terminal_manifest_found=bool(
+                    record.get("terminal_manifest_found", False)
+                ),
+                completion_source=(
+                    str(record["completion_source"])
+                    if record.get("completion_source") is not None
                     else None
                 ),
                 runtime_marker_path=f"{self.runtime_root}/{job_id}.json",
@@ -624,6 +694,11 @@ class ColabJobManager:
             "output_unavailable_reason": job.output_unavailable_reason,
             "error": job.error,
             "tracking_error": job.tracking_error,
+            "remote_response_bytes": job.remote_response_bytes,
+            "remote_output_count": job.remote_output_count,
+            "captured_runtime_output_bytes": job.captured_runtime_output_bytes,
+            "terminal_manifest_found": job.terminal_manifest_found,
+            "completion_source": job.completion_source,
         }
         if include_outputs:
             data["outputs"] = job.outputs
@@ -637,9 +712,13 @@ class ColabJobManager:
     ) -> list[dict[str, Any]]:
         arguments: dict[str, Any] = {"includeOutputs": False}
         if start is not None:
-            arguments["start"] = start
+            arguments["cellIndexStart"] = start
         if end is not None:
-            arguments["end"] = end
+            if start is not None and end <= start:
+                raise ValueError("cell metadata end must be greater than start")
+            # The frontend schema uses an inclusive end. Connector internals keep
+            # Python's conventional exclusive end so page-size accounting is clear.
+            arguments["cellIndexEnd"] = end - 1
         result = await self.session.call_tool("get_cells", arguments)
         cells = result_data(result).get("cells", [])
         if not isinstance(cells, list):
@@ -691,11 +770,58 @@ class ColabJobManager:
             count = offset + len(cells)
         return count
 
-    async def _find_cell_index(self, cell_id: str) -> int | None:
+    async def _find_cell(
+        self, cell_id: str, cell_index: int | None = None
+    ) -> tuple[dict[str, Any], int] | None:
+        if cell_index is not None and cell_index >= 0:
+            cells = await self._get_cells(start=cell_index, end=cell_index + 1)
+            if cells and cells[0].get("id") == cell_id:
+                return cells[0], cell_index
         async for offset, cells in self._cell_pages():
             for relative_index, cell in enumerate(cells):
                 if cell.get("id") == cell_id:
-                    return offset + relative_index
+                    return cell, offset + relative_index
+        return None
+
+    async def _find_cell_index(self, cell_id: str) -> int | None:
+        found = await self._find_cell(cell_id)
+        return found[1] if found is not None else None
+
+    @classmethod
+    def _is_owned_job_cell(cls, cell: dict[str, Any]) -> bool:
+        source = cls._cell_source_text(cell)
+        return bool(
+            source
+            and "def _cc_run_connector_job():" in source
+            and _JOB_SENTINEL in source
+        )
+
+    @classmethod
+    def _is_owned_probe_cell(cls, cell: dict[str, Any]) -> bool:
+        source = cls._cell_source_text(cell)
+        return bool(source and source.startswith(_PROBE_CELL_MARKER + "\n"))
+
+    async def _next_reusable_job_cell(
+        self, protected_cell_ids: set[str]
+    ) -> tuple[str, int] | None:
+        changed = False
+        for cell_id, cell_index in list(self._job_cells.items()):
+            if cell_id in protected_cell_ids:
+                continue
+            found = await self._find_cell(cell_id, cell_index)
+            if found is None or not self._is_owned_job_cell(found[0]):
+                self._job_cells.pop(cell_id, None)
+                changed = True
+                continue
+            current_index = found[1]
+            if current_index != cell_index:
+                self._job_cells[cell_id] = current_index
+                changed = True
+            if changed:
+                self._persist_journal()
+            return cell_id, current_index
+        if changed:
+            self._persist_journal()
         return None
 
     @staticmethod
@@ -851,14 +977,7 @@ class ColabJobManager:
                 if existing.state in {"running", "timed_out"}
                 and existing.tracking_state != "complete"
             }
-            reusable = next(
-                (
-                    (cell_id, cell_index)
-                    for cell_id, cell_index in self._job_cells.items()
-                    if cell_id not in protected_cell_ids
-                ),
-                None,
-            )
+            reusable = await self._next_reusable_job_cell(protected_cell_ids)
             if reusable is None:
                 if len(self._job_cells) >= self.max_job_cells:
                     raise RuntimeError(
@@ -887,10 +1006,15 @@ class ColabJobManager:
             wrapped_code = self._runtime_wrapper(job, code)
             if job.cell_id:
                 try:
-                    await self.session.call_tool(
+                    update_result = await self.session.call_tool(
                         "update_cell",
                         {"cellId": job.cell_id, "content": wrapped_code},
                     )
+                    updated_cell_id = result_data(update_result).get("cellId")
+                    if updated_cell_id is not None and updated_cell_id != job.cell_id:
+                        raise RuntimeError(
+                            "Colab updated a different cell than the requested job cell"
+                        )
                 except Exception:
                     try:
                         current_index = await self._find_cell_index(job.cell_id)
@@ -946,15 +1070,29 @@ class ColabJobManager:
                 {"cellId": job.cell_id},
                 timeout=job.execution_timeout_seconds,
             )
-            outputs = result_data(run_result).get("outputs", [])
-            if not isinstance(outputs, list):
-                outputs = []
+            data = result_data(run_result)
+            job.remote_response_bytes = len(json_bytes(data))
+            outputs = data.get("outputs", _MISSING)
             if job.state == "running":
+                if not isinstance(outputs, list):
+                    self._detach_job(
+                        job,
+                        "Malformed run_code_cell response: outputs must be a list",
+                        persist=False,
+                    )
+                    return
+                job.remote_output_count = len(outputs)
                 manifest = self._manifest_from_outputs(job, outputs)
                 if manifest is not None:
                     self._finish_from_manifest(job, manifest, persist=False)
-                else:
+                elif output_has_error(outputs):
                     self._finish_from_outputs(job, outputs, persist=False)
+                else:
+                    self._detach_job(
+                        job,
+                        "run_code_cell returned no matching terminal manifest",
+                        persist=False,
+                    )
         except asyncio.TimeoutError:
             if job.state == "running":
                 job.state = "timed_out"
@@ -1024,6 +1162,8 @@ class ColabJobManager:
         job.state = state if state in {"finished", "error"} else "error"
         job.tracking_state = "complete"
         job.execution_alive = False
+        job.terminal_manifest_found = True
+        job.completion_source = "terminal_manifest"
         job.error = _safe_error(manifest.get("error"))
         excerpt = manifest.get("output_excerpt", "")
         if not isinstance(excerpt, str):
@@ -1036,6 +1176,7 @@ class ColabJobManager:
             else []
         )
         job.output_bytes = max(0, int(manifest.get("output_bytes", len(excerpt_raw))))
+        job.captured_runtime_output_bytes = job.output_bytes
         job.output_excerpt_bytes = len(json_bytes(job.outputs))
         artifact_size = max(0, int(manifest.get("artifact_size_bytes", 0)))
         truncated = bool(manifest.get("output_truncated")) or job.output_bytes > len(
@@ -1067,12 +1208,17 @@ class ColabJobManager:
         *,
         persist: bool = True,
     ) -> None:
+        if not output_has_error(outputs):
+            raise ValueError(
+                "Non-manifest execution output cannot prove tracked job completion"
+            )
         raw = json_bytes(outputs)
         job.output_bytes = len(raw)
         job.error = output_error(outputs)
-        job.state = "error" if output_has_error(outputs) else "finished"
+        job.state = "error"
         job.tracking_state = "complete"
         job.execution_alive = False
+        job.completion_source = "explicit_cell_error"
         job.outputs = _excerpt_outputs(outputs, self.output_excerpt_bytes)
         job.output_excerpt_bytes = len(json_bytes(job.outputs))
         job.output_truncated = len(raw) > self.output_excerpt_bytes
@@ -1371,7 +1517,57 @@ class ColabJobManager:
         )
         result = await self._append_and_run_probe(code, timeout=probe_timeout)
         parsed = _sentinel_json(result, _RECONCILE_SENTINEL)
-        return parsed if isinstance(parsed, dict) else {}
+        if not isinstance(parsed, dict):
+            raise RuntimeError(
+                "Colab runtime probe returned no matching reconciliation sentinel"
+            )
+        return parsed
+
+    def kernel_readiness(self) -> dict[str, Any]:
+        return {
+            "kernel_execution_ready": self._kernel_execution_ready,
+            "kernel_probe_at": self._kernel_probe_at,
+            "kernel_probe_latency_ms": self._kernel_probe_latency_ms,
+            "kernel_probe_error": self._kernel_probe_error,
+        }
+
+    def mark_kernel_unknown(self, reason: str | None = None) -> None:
+        self._kernel_execution_ready = None
+        self._kernel_probe_at = None
+        self._kernel_probe_latency_ms = None
+        self._kernel_probe_error = _safe_error(reason)
+
+    async def probe_kernel(
+        self, timeout: float = DEFAULT_KERNEL_PROBE_TIMEOUT_SECONDS
+    ) -> dict[str, Any]:
+        nonce = uuid.uuid4().hex
+        code = (
+            "import builtins as _cc_builtins\n"
+            "import json\n"
+            f"_cc_builtins.print({_KERNEL_PROBE_SENTINEL!r} + "
+            f"json.dumps({{'nonce': {nonce!r}}}, separators=(',', ':')))\n"
+        )
+        started = time.monotonic()
+        try:
+            outputs = await self._append_and_run_probe(code, timeout=timeout)
+            proof = _sentinel_json(outputs, _KERNEL_PROBE_SENTINEL)
+            if not isinstance(proof, dict) or proof.get("nonce") != nonce:
+                raise RuntimeError(
+                    "Colab runtime probe returned no matching kernel sentinel"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._kernel_execution_ready = False
+            self._kernel_probe_error = _safe_error(
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            self._kernel_execution_ready = True
+            self._kernel_probe_error = None
+        self._kernel_probe_at = time.time()
+        self._kernel_probe_latency_ms = (time.monotonic() - started) * 1000
+        return self.kernel_readiness()
 
     async def _append_and_run_probe(
         self, code: str, *, timeout: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS
@@ -1387,13 +1583,25 @@ class ColabJobManager:
     async def _append_and_run_probe_locked(
         self, code: str, *, timeout: float
     ) -> list[Any]:
+        code = f"{_PROBE_CELL_MARKER}\n{code}"
         await self._recover_pending_probe_cell()
         cell_id = self._probe_cell_id
         if cell_id is not None:
+            found = await self._find_cell(cell_id)
+            if found is None or not self._is_owned_probe_cell(found[0]):
+                cell_id = None
+                self._probe_cell_id = None
+                self._persist_journal()
+        if cell_id is not None:
             try:
-                await self.session.call_tool(
+                update_result = await self.session.call_tool(
                     "update_cell", {"cellId": cell_id, "content": code}
                 )
+                updated_cell_id = result_data(update_result).get("cellId")
+                if updated_cell_id is not None and updated_cell_id != cell_id:
+                    raise RuntimeError(
+                        "Colab updated a different cell than the requested probe cell"
+                    )
             except Exception:
                 try:
                     current_index = await self._find_cell_index(cell_id)
@@ -1432,8 +1640,13 @@ class ColabJobManager:
         run = await self.session.call_tool(
             "run_code_cell", {"cellId": cell_id}, timeout=timeout
         )
-        outputs = result_data(run).get("outputs", [])
-        return outputs if isinstance(outputs, list) else []
+        data = result_data(run)
+        outputs = data.get("outputs", _MISSING)
+        if not isinstance(outputs, list):
+            raise RuntimeError(
+                "Malformed run_code_cell probe response: outputs must be a list"
+            )
+        return outputs
 
     async def read_artifact(
         self,
@@ -1536,6 +1749,11 @@ class ColabJobManager:
                 event = self._completion_events.get(job.job_id)
                 if event is not None:
                     event.set()
+        self._job_cells.clear()
+        self._probe_cell_id = None
+        self._pending_job_cell_sha256 = None
+        self._pending_probe_cell_sha256 = None
+        self.mark_kernel_unknown("Colab connection was reset")
         self._persist_journal()
 
     async def detach_for_shutdown(

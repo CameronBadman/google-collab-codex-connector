@@ -216,9 +216,11 @@ class NotebookFrontend:
                                 }
                                 for cell in self.runtime.cells
                             ]
-                            start = arguments.get("start", 0)
-                            end = arguments.get("end")
-                            cells = cells[start:end]
+                            start = arguments.get("cellIndexStart", 0)
+                            end = arguments.get("cellIndexEnd")
+                            cells = cells[
+                                start : end + 1 if isinstance(end, int) else None
+                            ]
                             result = {"cells": cells}
                         elif name == "add_code_cell":
                             result = {

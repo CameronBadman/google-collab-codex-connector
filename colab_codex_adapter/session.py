@@ -202,6 +202,10 @@ class ColabSessionManager:
         return self._remote_tool_list_timeout_seconds
 
     @property
+    def connection_id(self) -> str:
+        return self._connection_id
+
+    @property
     def browser_generation(self) -> int:
         return self._bridge.generation if self._bridge else 0
 
