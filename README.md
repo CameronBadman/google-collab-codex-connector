@@ -10,6 +10,45 @@ Codex workers reach that service through disposable stdio shims.
 > user, one active Colab browser tab, and one notebook runtime. It is not a
 > hosted or multi-tenant service.
 
+## Live MCP Activity (Build Week)
+
+The pre-Build Week connector baseline is tag `pre-openai-build-week` at
+`4aba40f`. Connector commit `6d03a97` adds structured activity events and
+standard MCP progress notifications to long-running operations. With the
+companion Codex build, one live status row is updated in place instead of
+appending every progress message to the transcript:
+
+```text
+MCP · colab (43s • esc to interrupt)
+  └ Waiting for cell completion · colab_run_python_wait
+```
+
+Activity is emitted before slow browser, runtime, notebook, cell-execution, and
+wait operations, and at terminal success, timeout, interruption, or failure.
+Messages are derived from typed connector state; submitted code, tokens, and
+full outputs are never included. Notification delivery is best-effort and
+cannot make the underlying Colab operation fail.
+
+The companion Codex implementation is based on `rust-v0.144.1` on branch
+`build-week/mcp-live-status`:
+
+- `86a0195` routes request-scoped MCP progress through RMCP, core, and app-server.
+- `ea1db51` renders generic MCP activity in the TUI and handles replacement,
+  concurrent calls, stale updates, higher-priority status, and cleanup.
+
+From the prepared companion checkout, build and run it with:
+
+```bash
+cd codex-rs
+cargo build -p codex-cli
+./target/debug/codex
+```
+
+The connector remains compatible with MCP clients that do not render progress;
+tool results and behavior are unchanged. The Codex branch must be published to
+a judge-accessible fork before submission so these commits can be installed
+outside the development workspace.
+
 ## Reliability Model
 
 - One detached loopback service owns the browser bridge, notebook session, job
