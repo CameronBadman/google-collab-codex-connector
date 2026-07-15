@@ -13,6 +13,7 @@ import pytest
 from mcp.types import CallToolResult, TextContent, Tool
 
 from colab_codex_adapter import jobs as jobs_module
+from colab_codex_adapter.activity import ActivityEvent, ActivityPhase
 from colab_codex_adapter.jobs import ColabJob, ColabJobManager
 from colab_codex_adapter.artifacts import ArtifactNotFoundError, ArtifactStore
 
@@ -208,6 +209,55 @@ async def test_run_python_async_returns_before_execution_finishes() -> None:
     assert status["last_output_at"] is not None
     assert status["tracking_state"] == "complete"
     assert status["execution_alive"] is False
+
+
+async def test_run_python_wait_reports_ordered_activity() -> None:
+    manager = ColabJobManager(FakeSession())  # type: ignore[arg-type]
+    events: list[ActivityEvent] = []
+
+    async def reporter(event: ActivityEvent) -> None:
+        events.append(event)
+
+    result_value = await manager.run_python_wait(
+        "print('ok')",
+        timeout_seconds=1.0,
+        reporter=reporter,
+    )
+
+    assert result_value["state"] == "finished"
+    assert [event.phase for event in events] == [
+        ActivityPhase.INITIALIZING_RUNTIME,
+        ActivityPhase.PREPARING_CELL,
+        ActivityPhase.PREPARING_CELL,
+        ActivityPhase.EXECUTING,
+        ActivityPhase.WAITING,
+        ActivityPhase.FINISHED,
+    ]
+    assert [event.message for event in events] == [
+        "Inspecting Colab runtime",
+        "Preparing tracked cell",
+        "Adding tracked cell",
+        "Starting cell execution",
+        "Waiting for cell completion",
+        "Cell execution finished",
+    ]
+    assert all("print('ok')" not in event.message for event in events)
+
+
+async def test_activity_reporter_failure_does_not_break_execution() -> None:
+    manager = ColabJobManager(FakeSession())  # type: ignore[arg-type]
+
+    async def failing_reporter(event: ActivityEvent) -> None:
+        del event
+        raise RuntimeError("notification transport unavailable")
+
+    result_value = await manager.run_python_wait(
+        "print('ok')",
+        timeout_seconds=1.0,
+        reporter=failing_reporter,
+    )
+
+    assert result_value["state"] == "finished"
 
 
 async def test_concurrent_job_starts_allocate_distinct_cell_indexes() -> None:

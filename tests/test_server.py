@@ -43,6 +43,33 @@ async def test_static_tool_list_is_available_without_colab_browser() -> None:
     }.issubset(names)
 
 
+async def test_connect_emits_progress_without_exposing_context_schema() -> None:
+    mcp = create_mcp()
+    progress: list[tuple[float, float | None, str | None]] = []
+
+    async def progress_handler(
+        current: float,
+        total: float | None,
+        message: str | None,
+    ) -> None:
+        progress.append((current, total, message))
+
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        result = await client.call_tool(
+            "colab_connect",
+            {"wait_seconds": 0.01, "open_browser": False},
+            progress_handler=progress_handler,
+        )
+
+    assert result.is_error is False
+    assert "ctx" not in tools["colab_connect"].inputSchema.get("properties", {})
+    assert progress == [
+        (1.0, None, "Waiting for Colab browser"),
+        (2.0, None, "Browser connection not ready"),
+    ]
+
+
 def test_stdio_shim_diagnostic_files_are_opt_in(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["colab-codex-adapter"])
 

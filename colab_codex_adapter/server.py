@@ -7,11 +7,12 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.server.proxy import FastMCPProxy, ProxyToolManager
@@ -22,6 +23,12 @@ from mcp.types import CallToolRequestParams
 from pydantic import ValidationError
 
 from . import __version__
+from .activity import (
+    ActivityEvent,
+    ActivityPhase,
+    ActivityReporter,
+    report_activity,
+)
 from .artifacts import (
     DEFAULT_ARTIFACT_DIR,
     ArtifactStore,
@@ -423,6 +430,33 @@ def create_mcp(
             artifact_store=artifacts,
         )
 
+    def activity_reporter(ctx: Context) -> ActivityReporter:
+        sequence = 0
+
+        async def publish(event: ActivityEvent) -> None:
+            nonlocal sequence
+            sequence += 1
+            await ctx.report_progress(
+                float(sequence), total=None, message=event.message
+            )
+
+        return publish
+
+    @asynccontextmanager
+    async def activity_scope(ctx: Context) -> AsyncIterator[ActivityReporter]:
+        reporter = activity_reporter(ctx)
+        try:
+            yield reporter
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await report_activity(
+                reporter,
+                ActivityPhase.FAILED,
+                "Colab operation failed",
+            )
+            raise
+
     def status_data(status: Any) -> dict[str, Any]:
         readiness = getattr(jobs, "kernel_readiness", lambda: {})()
         return {
@@ -442,15 +476,35 @@ def create_mcp(
 
     @mcp.tool()
     async def colab_connect(
-        wait_seconds: float = 60.0, open_browser: bool = False
+        ctx: Context,
+        wait_seconds: float = 60.0,
+        open_browser: bool = False,
     ) -> ToolResult:
         """Open the Colab connection URL and wait for the browser session."""
-        status = await session.connect(
-            wait_seconds=wait_seconds, open_browser=open_browser
-        )
-        if browser_state_file is not None:
-            _persist_session(session, browser_state_file)
-        return response(status_data(status), "Colab connection status")
+        async with activity_scope(ctx) as reporter:
+            await report_activity(
+                reporter,
+                ActivityPhase.WAITING_FOR_BROWSER,
+                "Waiting for Colab browser",
+            )
+            status = await session.connect(
+                wait_seconds=wait_seconds, open_browser=open_browser
+            )
+            if browser_state_file is not None:
+                _persist_session(session, browser_state_file)
+            if status.remote_mcp_initialized:
+                await report_activity(
+                    reporter,
+                    ActivityPhase.FINISHED,
+                    "Colab runtime connected",
+                )
+            else:
+                await report_activity(
+                    reporter,
+                    ActivityPhase.TIMED_OUT,
+                    "Browser connection not ready",
+                )
+            return response(status_data(status), "Colab connection status")
 
     @mcp.tool()
     async def colab_status(include_remote_tools: bool = False) -> ToolResult:
@@ -640,6 +694,7 @@ def create_mcp(
 
     @mcp.tool()
     async def colab_run_cell(
+        ctx: Context,
         cell_id: str | None = None,
         cell_index: int | None = None,
         remote_tool_name: str | None = None,
@@ -647,58 +702,81 @@ def create_mcp(
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> ToolResult:
         """Execute existing CPython source through the bounded tracked runner."""
-        if remote_tool_name is not None:
-            raise ValueError("Unbounded remote cell execution is disabled")
-        source_cell_id, source = await _cell_source(
-            session, cell_id=cell_id, cell_index=cell_index
-        )
-        data = await jobs.run_python_wait(
-            source,
-            timeout_seconds=timeout_seconds,
-            execution_timeout_seconds=execution_timeout_seconds,
-        )
-        data["source_cell_id"] = source_cell_id
-        return response(data, "Colab cell source execution")
+        async with activity_scope(ctx) as reporter:
+            if remote_tool_name is not None:
+                raise ValueError("Unbounded remote cell execution is disabled")
+            await report_activity(
+                reporter,
+                ActivityPhase.INSPECTING_NOTEBOOK,
+                "Inspecting notebook cell",
+            )
+            source_cell_id, source = await _cell_source(
+                session, cell_id=cell_id, cell_index=cell_index
+            )
+            data = await jobs.run_python_wait(
+                source,
+                timeout_seconds=timeout_seconds,
+                execution_timeout_seconds=execution_timeout_seconds,
+                reporter=reporter,
+            )
+            data["source_cell_id"] = source_cell_id
+            return response(data, "Colab cell source execution")
 
     @mcp.tool()
     async def colab_run_python(
+        ctx: Context,
         code: str,
         timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
         remote_tool_name: str | None = None,
     ) -> ToolResult:
         """Execute Python code in the connected Colab runtime."""
-        if remote_tool_name is not None:
-            raise ValueError("Unbounded remote Python execution is disabled")
-        names = await _remote_tool_names(session)
-        if not {
-            "add_code_cell",
-            "run_code_cell",
-            "get_cells",
-            "update_cell",
-        }.issubset(names):
-            raise ValueError(
-                "Tracked Python execution is unavailable in this Colab frontend"
+        async with activity_scope(ctx) as reporter:
+            if remote_tool_name is not None:
+                raise ValueError("Unbounded remote Python execution is disabled")
+            await report_activity(
+                reporter,
+                ActivityPhase.INITIALIZING_RUNTIME,
+                "Inspecting Colab runtime",
             )
-        data = await jobs.run_python_wait(
-            code,
-            timeout_seconds=timeout_seconds,
-            execution_timeout_seconds=execution_timeout_seconds,
-        )
-        return response(data, "Colab Python execution")
+            names = await _remote_tool_names(session)
+            if not {
+                "add_code_cell",
+                "run_code_cell",
+                "get_cells",
+                "update_cell",
+            }.issubset(names):
+                raise ValueError(
+                    "Tracked Python execution is unavailable in this Colab frontend"
+                )
+            data = await jobs.run_python_wait(
+                code,
+                timeout_seconds=timeout_seconds,
+                execution_timeout_seconds=execution_timeout_seconds,
+                reporter=reporter,
+            )
+            return response(data, "Colab Python execution")
 
     @mcp.tool()
     async def colab_run_python_async(
+        ctx: Context,
         code: str,
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> ToolResult:
         """Start a tracked Python cell job and return its job id."""
-        return response(
-            await jobs.start_python(
-                code, execution_timeout_seconds=execution_timeout_seconds
-            ),
-            "Colab Python job started",
-        )
+        async with activity_scope(ctx) as reporter:
+            data = await jobs.start_python(
+                code,
+                execution_timeout_seconds=execution_timeout_seconds,
+                reporter=reporter,
+            )
+            await report_activity(
+                reporter,
+                ActivityPhase.FINISHED,
+                "Colab job started",
+                job_id=data["job_id"],
+            )
+            return response(data, "Colab Python job started")
 
     @mcp.tool()
     async def colab_job_status(job_id: str) -> ToolResult:
@@ -707,28 +785,37 @@ def create_mcp(
 
     @mcp.tool()
     async def colab_wait_job(
-        job_id: str, timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS
+        ctx: Context,
+        job_id: str,
+        timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
     ) -> ToolResult:
         """Wait until a tracked Colab job finishes or the timeout expires."""
-        return response(
-            await jobs.wait(job_id, timeout_seconds), "Colab job wait result"
-        )
+        async with activity_scope(ctx) as reporter:
+            return response(
+                await jobs.wait(
+                    job_id, timeout_seconds, reporter=reporter
+                ),
+                "Colab job wait result",
+            )
 
     @mcp.tool()
     async def colab_run_python_wait(
+        ctx: Context,
         code: str,
         timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
     ) -> ToolResult:
         """Run Python in a tracked cell job and wait for its outputs."""
-        return response(
-            await jobs.run_python_wait(
-                code,
-                timeout_seconds,
-                execution_timeout_seconds=execution_timeout_seconds,
-            ),
-            "Colab Python job result",
-        )
+        async with activity_scope(ctx) as reporter:
+            return response(
+                await jobs.run_python_wait(
+                    code,
+                    timeout_seconds,
+                    execution_timeout_seconds=execution_timeout_seconds,
+                    reporter=reporter,
+                ),
+                "Colab Python job result",
+            )
 
     @mcp.tool()
     async def colab_list_jobs() -> ToolResult:
@@ -754,35 +841,43 @@ def create_mcp(
 
     @mcp.tool()
     async def colab_install_package(
+        ctx: Context,
         packages: list[str] | str,
         timeout_seconds: float = MAX_WAIT_TIMEOUT_SECONDS,
         execution_timeout_seconds: float = 3600.0,
         remote_tool_name: str | None = None,
     ) -> ToolResult:
         """Install one or more Python packages into the connected Colab runtime."""
-        package_value = packages if isinstance(packages, list) else [packages]
-        if remote_tool_name is None:
-            names = await _remote_tool_names(session)
-            if {
-                "add_code_cell",
-                "run_code_cell",
-                "get_cells",
-                "update_cell",
-            }.issubset(names):
-                install_code = (
-                    "import subprocess, sys\n"
-                    f"subprocess.run([sys.executable, '-m', 'pip', 'install', "
-                    f"*{package_value!r}], check=True)"
+        async with activity_scope(ctx) as reporter:
+            package_value = packages if isinstance(packages, list) else [packages]
+            if remote_tool_name is None:
+                await report_activity(
+                    reporter,
+                    ActivityPhase.INITIALIZING_RUNTIME,
+                    "Inspecting Colab runtime",
                 )
-                data = await jobs.run_python_wait(
-                    install_code,
-                    timeout_seconds=timeout_seconds,
-                    execution_timeout_seconds=execution_timeout_seconds,
-                )
-                return response(data, "Colab package installation")
-        raise ValueError(
-            "Tracked package installation is unavailable in this Colab frontend"
-        )
+                names = await _remote_tool_names(session)
+                if {
+                    "add_code_cell",
+                    "run_code_cell",
+                    "get_cells",
+                    "update_cell",
+                }.issubset(names):
+                    install_code = (
+                        "import subprocess, sys\n"
+                        f"subprocess.run([sys.executable, '-m', 'pip', 'install', "
+                        f"*{package_value!r}], check=True)"
+                    )
+                    data = await jobs.run_python_wait(
+                        install_code,
+                        timeout_seconds=timeout_seconds,
+                        execution_timeout_seconds=execution_timeout_seconds,
+                        reporter=reporter,
+                    )
+                    return response(data, "Colab package installation")
+            raise ValueError(
+                "Tracked package installation is unavailable in this Colab frontend"
+            )
 
     return mcp
 
@@ -922,7 +1017,7 @@ async def run_broker_daemon_backend(state: BrokerState) -> None:
             port=port,
             log_level="critical",
             uvicorn_config={"access_log": False, "log_config": None},
-            json_response=True,
+            json_response=False,
             stateless_http=True,
         )
     finally:
@@ -937,7 +1032,12 @@ async def run_broker_daemon_backend(state: BrokerState) -> None:
 
 
 def _proxy_server(launcher: BrokerLauncher) -> FastMCPProxy:
-    clients = BrokerClientFactory(launcher, timeout=1200.0, init_timeout=30.0)
+    clients = BrokerClientFactory(
+        launcher,
+        timeout=1200.0,
+        init_timeout=30.0,
+        proxy_progress=True,
+    )
 
     class BrokerOwnerLost(RuntimeError):
         def __init__(self, state: BrokerState) -> None:

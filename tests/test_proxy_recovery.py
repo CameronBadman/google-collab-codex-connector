@@ -21,7 +21,7 @@ def _write_failure_runtime(path: Path) -> None:
 import os
 import signal
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware
 
@@ -70,13 +70,18 @@ async def serve(state):
             "generation": state.generation,
         }
 
+    @backend.tool()
+    async def progress_probe(ctx: Context):
+        await ctx.report_progress(1.0, message="Backend progress reached proxy")
+        return {"ok": True}
+
     await backend.run_http_async(
         show_banner=False,
         host="127.0.0.1",
         port=int(state.endpoint.split(":")[2].split("/")[0]),
         log_level="critical",
         uvicorn_config={"access_log": False, "log_config": None},
-        json_response=True,
+        json_response=False,
         stateless_http=True,
     )
 """.lstrip(),
@@ -146,7 +151,21 @@ async def test_proxy_recovers_inflight_discovery_without_replaying_mutation(
                 "broker_identity",
                 "colab_status",
                 "die_during_call",
+                "progress_probe",
             }.issubset(names)
+
+            progress = []
+
+            async def progress_handler(current, total, message):
+                progress.append((current, total, message))
+
+            progress_result = await client.call_tool(
+                "progress_probe", {}, progress_handler=progress_handler
+            )
+            assert progress_result.data == {"ok": True}
+            assert progress == [
+                (1.0, None, "Backend progress reached proxy")
+            ]
 
             ambiguous = await client.call_tool(
                 "die_during_call", {}, raise_on_error=False

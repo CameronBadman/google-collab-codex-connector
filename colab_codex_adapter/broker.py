@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import IO, Any, AsyncIterator, Callable
 
 from fastmcp import Client
+from fastmcp.server.proxy import ProxyClient
 
 from .diagnostics import DEFAULT_RUNTIME_DIR
 
@@ -439,10 +440,12 @@ class BrokerClientFactory:
         *,
         timeout: float = 1200.0,
         init_timeout: float = 30.0,
+        proxy_progress: bool = False,
     ) -> None:
         self.launcher = launcher or BrokerLauncher()
         self.timeout = timeout
         self.init_timeout = init_timeout
+        self.proxy_progress = proxy_progress
         self._used_states: weakref.WeakKeyDictionary[
             asyncio.Task[Any], BrokerState
         ] = weakref.WeakKeyDictionary()
@@ -451,7 +454,8 @@ class BrokerClientFactory:
         return await self.launcher.ensure_running()
 
     def _client_for(self, state: BrokerState) -> Client[Any]:
-        return Client(
+        client_type = ProxyClient if self.proxy_progress else Client
+        return client_type(
             state.endpoint,
             auth=state.token,
             timeout=self.timeout,

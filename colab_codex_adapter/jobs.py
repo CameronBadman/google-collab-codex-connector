@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .activity import ActivityPhase, ActivityReporter, report_activity
 from .artifacts import (
     DEFAULT_ARTIFACT_TTL_SECONDS,
     DEFAULT_MAX_ARTIFACT_TOTAL_BYTES,
@@ -942,6 +943,8 @@ class ColabJobManager:
         code: str,
         language: str = "python",
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        *,
+        reporter: ActivityReporter | None = None,
     ) -> dict[str, Any]:
         if language.lower() not in {"python", "py", "python3"}:
             raise ValueError("Tracked Colab jobs support CPython only")
@@ -954,6 +957,11 @@ class ColabJobManager:
                 "execution_timeout_seconds must be greater than zero and no more "
                 f"than {MAX_EXECUTION_TIMEOUT_SECONDS:g}"
             )
+        await report_activity(
+            reporter,
+            ActivityPhase.INITIALIZING_RUNTIME,
+            "Inspecting Colab runtime",
+        )
         names = await self._remote_tool_names()
         required = {"add_code_cell", "run_code_cell", "get_cells", "update_cell"}
         if not required.issubset(names):
@@ -963,6 +971,11 @@ class ColabJobManager:
         job_id = uuid.uuid4().hex
         started_at = time.time()
         code_raw = code.encode("utf-8")
+        await report_activity(
+            reporter,
+            ActivityPhase.PREPARING_CELL,
+            "Preparing tracked cell",
+        )
         async with self._lock:
             await self._recover_pending_job_cell()
             self._prune_completed_jobs(reserve=1)
@@ -1005,6 +1018,12 @@ class ColabJobManager:
             )
             wrapped_code = self._runtime_wrapper(job, code)
             if job.cell_id:
+                await report_activity(
+                    reporter,
+                    ActivityPhase.PREPARING_CELL,
+                    "Updating tracked cell",
+                    job_id=job.job_id,
+                )
                 try:
                     update_result = await self.session.call_tool(
                         "update_cell",
@@ -1028,6 +1047,12 @@ class ColabJobManager:
                             self._job_cells[job.cell_id] = current_index
                     raise
             else:
+                await report_activity(
+                    reporter,
+                    ActivityPhase.PREPARING_CELL,
+                    "Adding tracked cell",
+                    job_id=job.job_id,
+                )
                 self._pending_job_cell_sha256 = hashlib.sha256(
                     wrapped_code.encode("utf-8")
                 ).hexdigest()
@@ -1061,6 +1086,12 @@ class ColabJobManager:
                 self._execute(job), name=f"colab-job-{job.job_id}"
             )
             self._persist_journal()
+        await report_activity(
+            reporter,
+            ActivityPhase.EXECUTING,
+            "Starting cell execution",
+            job_id=job.job_id,
+        )
         return self._job_dict(job)
 
     async def _execute(self, job: ColabJob) -> None:
@@ -1288,6 +1319,8 @@ class ColabJobManager:
         self,
         job_id: str,
         timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+        *,
+        reporter: ActivityReporter | None = None,
     ) -> dict[str, Any]:
         if not math.isfinite(timeout_seconds) or not (
             MIN_WAIT_TIMEOUT_SECONDS <= timeout_seconds <= MAX_WAIT_TIMEOUT_SECONDS
@@ -1297,6 +1330,12 @@ class ColabJobManager:
                 f"{MIN_WAIT_TIMEOUT_SECONDS:g} and {MAX_WAIT_TIMEOUT_SECONDS:g}"
             )
         job = self._get_job(job_id)
+        await report_activity(
+            reporter,
+            ActivityPhase.WAITING,
+            "Waiting for cell completion",
+            job_id=job_id,
+        )
 
         wait_started = time.monotonic()
         wait_timed_out = False
@@ -1306,23 +1345,65 @@ class ColabJobManager:
                 await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
             except asyncio.TimeoutError:
                 wait_timed_out = True
-        return {
+        result = {
             **self._job_dict(job),
             "timed_out": wait_timed_out,
             "wait_timed_out": wait_timed_out,
             "waited_seconds": time.monotonic() - wait_started,
         }
+        if wait_timed_out:
+            await report_activity(
+                reporter,
+                ActivityPhase.TIMED_OUT,
+                "Wait timed out; job continues",
+                job_id=job_id,
+            )
+        elif job.state == "finished":
+            await report_activity(
+                reporter,
+                ActivityPhase.FINISHED,
+                "Cell execution finished",
+                job_id=job_id,
+            )
+        elif job.state == "timed_out":
+            await report_activity(
+                reporter,
+                ActivityPhase.TIMED_OUT,
+                "Cell execution timed out",
+                job_id=job_id,
+            )
+        elif job.tracking_state == "detached":
+            await report_activity(
+                reporter,
+                ActivityPhase.INTERRUPTED,
+                "Tracking interrupted; recovery pending",
+                job_id=job_id,
+            )
+        elif job.state in _TERMINAL_STATES:
+            await report_activity(
+                reporter,
+                ActivityPhase.FAILED,
+                "Cell execution failed",
+                job_id=job_id,
+            )
+        return result
 
     async def run_python_wait(
         self,
         code: str,
         timeout_seconds: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
         execution_timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        *,
+        reporter: ActivityReporter | None = None,
     ) -> dict[str, Any]:
         started = await self.start_python(
-            code, execution_timeout_seconds=execution_timeout_seconds
+            code,
+            execution_timeout_seconds=execution_timeout_seconds,
+            reporter=reporter,
         )
-        return await self.wait(started["job_id"], timeout_seconds)
+        return await self.wait(
+            started["job_id"], timeout_seconds, reporter=reporter
+        )
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return [self._job_dict(job, include_outputs=False) for job in self.jobs.values()]
