@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "colab-runner": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        ".",
+        "--locked",
+        "colab-runner-mcp"
+      ],
+      "cwd": ".",
+      "startup_timeout_sec": 120,
+      "tool_timeout_sec": 86400
+    }
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab Runner"
+  short_description: "Run safe, observable jobs on Google Colab"
+  default_prompt: "Use $colab-runner to run this Python workload on Colab and retrieve its artifacts safely."
