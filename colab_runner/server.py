@@ -43,8 +43,10 @@ def create_mcp(
             "Run safe, observable workloads through Google's official Colab CLI. "
             "Use colab_cli_doctor before the first allocation. Use colab_run_job "
             "for isolated work, or a leased session for repeated stateful "
-            "execution. Stop leased sessions promptly; idle leases and server "
-            "shutdown trigger automatic cleanup."
+            "execution. Inspect and update local notebook cells with guarded "
+            "cell tools, and use background cell execution plus cell status for "
+            "long-running steps. Stop leased sessions promptly; idle leases and "
+            "server shutdown trigger automatic cleanup."
         ),
         lifespan=lifespan,
         mask_error_details=True,
@@ -143,6 +145,63 @@ def create_mcp(
         )
 
     @mcp.tool()
+    async def colab_notebook_cells(
+        notebook_path: str,
+        ctx: Context,
+        start: int = 0,
+        limit: int = 50,
+        include_source: bool = False,
+        source_excerpt_bytes: int = 2048,
+        session_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Inspect a bounded page of local notebook cells and source hashes."""
+        if session_name is not None:
+            validate_session_name(session_name)
+        await reporter(ctx)("Inspecting local notebook cells")
+        result = await managed_sessions.notebooks.inspect(
+            notebook_path,
+            start=start,
+            limit=limit,
+            include_source=include_source,
+            source_excerpt_bytes=source_excerpt_bytes,
+        )
+        for cell in result["cells"]:
+            latest = managed_sessions.latest_cell_execution(
+                notebook_path=result["notebook_path"],
+                cell_index=cell["cell_index"],
+                cell_id=cell["cell_id"],
+                session_name=session_name,
+            )
+            if latest is not None:
+                latest["source_matches"] = (
+                    latest["selected_cell"]["source_sha256"]
+                    == cell["source_sha256"]
+                )
+            cell["latest_execution"] = latest
+        return result
+
+    @mcp.tool()
+    async def colab_update_notebook_cell(
+        notebook_path: str,
+        source: str,
+        expected_source_sha256: str,
+        ctx: Context,
+        cell_index: int | None = None,
+        cell_id: str | None = None,
+        clear_outputs: bool = True,
+    ) -> dict[str, Any]:
+        """Atomically update one local cell if its inspected source hash matches."""
+        await reporter(ctx)("Updating local notebook cell")
+        return await managed_sessions.notebooks.update_cell(
+            notebook_path,
+            source=source,
+            expected_source_sha256=expected_source_sha256,
+            cell_index=cell_index,
+            cell_id=cell_id,
+            clear_outputs=clear_outputs,
+        )
+
+    @mcp.tool()
     async def colab_execute(
         session_name: str,
         script_path: str,
@@ -150,6 +209,8 @@ def create_mcp(
         cell_index: int | None = None,
         cell_id: str | None = None,
         timeout_seconds: float = 1800,
+        background: bool = False,
+        write_output_to_notebook: bool = False,
     ) -> dict[str, Any]:
         """Execute a file or selected notebook cell on a reusable session."""
         return await managed_sessions.execute(
@@ -158,8 +219,19 @@ def create_mcp(
             cell_index=cell_index,
             cell_id=cell_id,
             timeout_seconds=timeout_seconds,
+            background=background,
+            write_output_to_notebook=write_output_to_notebook,
             reporter=reporter(ctx),
         )
+
+    @mcp.tool()
+    async def colab_cell_status(
+        execution_id: str,
+        ctx: Context,
+    ) -> dict[str, Any]:
+        """Read bounded status and output for one notebook-cell execution."""
+        await reporter(ctx)("Reading notebook cell execution status")
+        return managed_sessions.cell_status(execution_id)
 
     @mcp.tool()
     async def colab_renew_session(

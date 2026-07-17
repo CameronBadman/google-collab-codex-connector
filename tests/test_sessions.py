@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ class FakeCli:
         fail_stop: bool = False,
         fail_command: str | None = None,
         exec_delay: float = 0,
+        exec_stdout: str = "cell complete\n",
     ) -> None:
         self.calls: list[list[str]] = []
         self.executed_sources: list[str] = []
@@ -32,6 +34,7 @@ class FakeCli:
         self.fail_stop = fail_stop
         self.fail_command = fail_command
         self.exec_delay = exec_delay
+        self.exec_stdout = exec_stdout
         self.active_execs = 0
         self.max_active_execs = 0
 
@@ -66,7 +69,7 @@ class FakeCli:
                     raise ProcessExecutionError(
                         _result(returncode=1, stderr="user code failed\n")
                     )
-                return _result(stdout="cell complete\n")
+                return _result(stdout=self.exec_stdout)
             finally:
                 self.active_execs -= 1
         if command == "download":
@@ -139,6 +142,9 @@ async def test_reusable_session_runs_script_and_selected_notebook_cell(
         "cell_index": 2,
         "cell_id": "target-cell",
         "source_bytes": len(b"print(shared_value + 2)"),
+        "source_sha256": hashlib.sha256(
+            b"print(shared_value + 2)"
+        ).hexdigest(),
     }
     assert cli.executed_sources == [
         "shared_value = 40\n",
@@ -155,6 +161,165 @@ async def test_reusable_session_runs_script_and_selected_notebook_cell(
     stopped = await manager.stop_session(session_name)
     assert stopped["ok"] is True
     assert manager.leases() == []
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_background_cell_execution_is_observable_and_writes_output(
+    tmp_path: Path,
+) -> None:
+    notebook = tmp_path / "steps.ipynb"
+    _write_notebook(notebook)
+    cli = FakeCli(exec_delay=0.03, exec_stdout="answer=42\n")
+    manager = _manager(cli)
+    started = await manager.start_session(idle_timeout_seconds=5)
+    session_name = started["session_name"]
+
+    queued = await manager.execute(
+        session_name=session_name,
+        script_path=str(notebook),
+        cell_id="target-cell",
+        timeout_seconds=30,
+        background=True,
+        write_output_to_notebook=True,
+    )
+    execution_id = queued["execution_id"]
+
+    assert queued["state"] == "queued"
+    assert queued["cell_execution"]["terminal"] is False
+    await _wait_until(lambda: manager.cell_status(execution_id)["terminal"])
+    status = manager.cell_status(execution_id)
+    latest = manager.latest_cell_execution(
+        notebook_path=str(notebook),
+        cell_index=2,
+        cell_id="target-cell",
+        session_name=session_name,
+    )
+
+    assert status["state"] == "finished"
+    assert status["execution"]["stdout"] == "answer=42\n"
+    assert status["output_writeback"]["written"] is True
+    assert latest is not None
+    assert latest["execution_id"] == execution_id
+    saved = nbformat.read(notebook, as_version=4).cells[2]
+    assert saved.outputs[0].text == "answer=42\n"
+    assert saved.metadata["colab_runner"]["execution_id"] == execution_id
+
+    await manager.stop_session(session_name)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_cell_rejects_background_output_writeback(
+    tmp_path: Path,
+) -> None:
+    notebook = tmp_path / "steps.ipynb"
+    _write_notebook(notebook)
+    cli = FakeCli(exec_delay=0.05)
+    manager = _manager(cli)
+    started = await manager.start_session(idle_timeout_seconds=5)
+    session_name = started["session_name"]
+    queued = await manager.execute(
+        session_name=session_name,
+        script_path=str(notebook),
+        cell_id="target-cell",
+        background=True,
+        write_output_to_notebook=True,
+    )
+    await _wait_until(lambda: cli.active_execs == 1)
+    cells = await manager.notebooks.inspect(str(notebook))
+    await manager.notebooks.update_cell(
+        str(notebook),
+        cell_id="target-cell",
+        cell_index=None,
+        source="print('new source')",
+        expected_source_sha256=cells["cells"][2]["source_sha256"],
+    )
+    await _wait_until(
+        lambda: manager.cell_status(queued["execution_id"])["terminal"]
+    )
+
+    status = manager.cell_status(queued["execution_id"])
+    assert status["state"] == "finished"
+    assert status["output_writeback"]["state"] == "conflict"
+    assert status["output_writeback"]["written"] is False
+    saved = nbformat.read(notebook, as_version=4).cells[2]
+    assert saved.source == "print('new source')"
+    assert saved.outputs == []
+
+    await manager.stop_session(session_name)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_stopping_session_interrupts_background_cell(tmp_path: Path) -> None:
+    notebook = tmp_path / "steps.ipynb"
+    _write_notebook(notebook)
+    cli = FakeCli(exec_delay=10)
+    manager = _manager(cli)
+    started = await manager.start_session(idle_timeout_seconds=5)
+    session_name = started["session_name"]
+    queued = await manager.execute(
+        session_name=session_name,
+        script_path=str(notebook),
+        cell_id="target-cell",
+        background=True,
+        write_output_to_notebook=True,
+    )
+    await _wait_until(lambda: cli.active_execs == 1)
+
+    stopped = await asyncio.wait_for(
+        manager.stop_session(session_name),
+        timeout=1,
+    )
+    status = manager.cell_status(queued["execution_id"])
+
+    assert stopped["ok"] is True
+    assert status["state"] == "interrupted"
+    assert status["output_writeback"]["state"] == "skipped"
+    assert not manager.is_managed(session_name)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cell_status_bounds_large_execution_output(tmp_path: Path) -> None:
+    notebook = tmp_path / "steps.ipynb"
+    _write_notebook(notebook)
+    cli = FakeCli(exec_stdout="x" * 20_000)
+    manager = _manager(cli)
+    started = await manager.start_session(idle_timeout_seconds=5)
+    session_name = started["session_name"]
+
+    result = await manager.execute(
+        session_name=session_name,
+        script_path=str(notebook),
+        cell_id="target-cell",
+    )
+    status = manager.cell_status(result["execution_id"])
+
+    assert status["state"] == "finished"
+    assert status["execution"]["stdout_bytes"] <= 8 * 1024
+    assert status["execution"]["stdout_truncated"] is True
+    await manager.stop_session(session_name)
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_background_execution_requires_a_selected_notebook_cell(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "step.py"
+    script.write_text("print('step')\n", encoding="utf-8")
+    manager = _manager(FakeCli())
+    started = await manager.start_session(idle_timeout_seconds=5)
+
+    with pytest.raises(ValueError, match="selected notebook cell"):
+        await manager.execute(
+            session_name=started["session_name"],
+            script_path=str(script),
+            background=True,
+        )
+
     await manager.close()
 
 

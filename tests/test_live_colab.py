@@ -134,7 +134,10 @@ async def test_reusable_live_session_preserves_state_and_runs_selected_cell(
     tmp_path: Path,
 ) -> None:
     setup_script = tmp_path / "state_setup.py"
-    setup_script.write_text("live_value = 40\n", encoding="utf-8")
+    setup_script.write_text(
+        "live_value = 40\nprint('COLAB_RUNNER_SETUP_READY')\n",
+        encoding="utf-8",
+    )
     notebook_path = tmp_path / "state_steps.ipynb"
     notebook = nbformat.v4.new_notebook(
         cells=[
@@ -173,15 +176,31 @@ async def test_reusable_live_session_preserves_state_and_runs_selected_cell(
             timeout_seconds=300,
         )
         assert setup["ok"] is True, setup
+        assert "COLAB_RUNNER_SETUP_READY" in setup["execution"]["stdout"]
 
         selected = await manager.execute(
             session_name=session_name,
             script_path=str(notebook_path),
             cell_id="state-check",
             timeout_seconds=300,
+            background=True,
+            write_output_to_notebook=True,
         )
         assert selected["ok"] is True, selected
-        assert "COLAB_RUNNER_STATE=42" in selected["execution"]["stdout"]
+        execution_id = selected["execution_id"]
+        deadline = asyncio.get_running_loop().time() + 300
+        while True:
+            cell_status = manager.cell_status(execution_id)
+            if cell_status["terminal"]:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("selected-cell execution did not finish within 300 seconds")
+            await asyncio.sleep(0.25)
+        assert cell_status["state"] == "finished", cell_status
+        assert "COLAB_RUNNER_STATE=42" in cell_status["execution"]["stdout"]
+        assert cell_status["output_writeback"]["written"] is True
+        written_cell = nbformat.read(notebook_path, as_version=4).cells[1]
+        assert "COLAB_RUNNER_STATE=42" in written_cell.outputs[0].text
 
         downloaded = await manager.download_artifact(
             session_name=session_name,

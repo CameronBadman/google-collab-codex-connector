@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import nbformat
 import pytest
 from fastmcp import Client
 
@@ -16,15 +18,18 @@ async def test_server_exposes_only_the_official_cli_surface() -> None:
 
     assert set(tools) == {
         "colab_cli_doctor",
+        "colab_cell_status",
         "colab_download_artifact",
         "colab_execute",
         "colab_export_log",
+        "colab_notebook_cells",
         "colab_renew_session",
         "colab_run_job",
         "colab_session_status",
         "colab_sessions",
         "colab_start_session",
         "colab_stop_session",
+        "colab_update_notebook_cell",
     }
     assert not any("browser" in name for name in tools)
 
@@ -134,6 +139,98 @@ async def test_server_wires_reusable_session_lifecycle(tmp_path: Path) -> None:
     assert cli.calls[0][0] == "new"
     assert any(call[0] == "exec" for call in cli.calls)
     assert cli.calls[-1] == ["stop", "-s", session_name]
+
+
+@pytest.mark.asyncio
+async def test_server_wires_notebook_cell_management(tmp_path: Path) -> None:
+    notebook_path = tmp_path / "managed.ipynb"
+    notebook = nbformat.v4.new_notebook(
+        cells=[
+            nbformat.v4.new_code_cell("print('old')", id="target"),
+        ]
+    )
+    nbformat.write(notebook, notebook_path)
+    cli = StatefulCli()
+
+    async with Client(create_mcp(cli)) as client:
+        started = await client.call_tool(
+            "colab_start_session",
+            {
+                "idle_timeout_seconds": 60,
+                "session_name_prefix": "cell-tools",
+            },
+        )
+        session_name = started.structured_content["session_name"]
+        inspected = await client.call_tool(
+            "colab_notebook_cells",
+            {
+                "notebook_path": str(notebook_path),
+                "include_source": True,
+                "session_name": session_name,
+            },
+        )
+        inspected_data = inspected.structured_content
+        assert inspected_data is not None
+        cell = inspected_data["cells"][0]
+        assert cell["source"] == "print('old')"
+        assert cell["latest_execution"] is None
+
+        updated = await client.call_tool(
+            "colab_update_notebook_cell",
+            {
+                "notebook_path": str(notebook_path),
+                "cell_id": "target",
+                "source": "print('new')",
+                "expected_source_sha256": cell["source_sha256"],
+            },
+        )
+        assert updated.structured_content["state"] == "updated"
+
+        queued = await client.call_tool(
+            "colab_execute",
+            {
+                "session_name": session_name,
+                "script_path": str(notebook_path),
+                "cell_id": "target",
+                "background": True,
+                "write_output_to_notebook": True,
+                "timeout_seconds": 30,
+            },
+        )
+        execution_id = queued.structured_content["execution_id"]
+        for _ in range(100):
+            status = await client.call_tool(
+                "colab_cell_status",
+                {"execution_id": execution_id},
+            )
+            status_data = status.structured_content
+            assert status_data is not None
+            if status_data["terminal"]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("background cell did not finish")
+
+        assert status_data["state"] == "finished"
+        assert status_data["output_writeback"]["written"] is True
+        cells_after = await client.call_tool(
+            "colab_notebook_cells",
+            {
+                "notebook_path": str(notebook_path),
+                "session_name": session_name,
+            },
+        )
+        latest = cells_after.structured_content["cells"][0]["latest_execution"]
+        assert latest["execution_id"] == execution_id
+        assert latest["source_matches"] is True
+        await client.call_tool(
+            "colab_stop_session",
+            {"session_name": session_name},
+        )
+
+    saved = nbformat.read(notebook_path, as_version=4).cells[0]
+    assert saved.source == "print('new')"
+    assert saved.outputs[0].text == "step complete\n"
 
 
 class StatefulCli:
