@@ -5,10 +5,12 @@ import os
 import uuid
 from pathlib import Path
 
+import nbformat
 import pytest
 
 from colab_runner.cli import ColabCli
 from colab_runner.orchestrator import ColabJobOrchestrator
+from colab_runner.sessions import ColabSessionManager
 
 
 pytestmark = pytest.mark.live
@@ -115,6 +117,90 @@ async def test_cancelled_live_job_releases_its_generated_session(
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+    sessions = await cli.run(["sessions"], timeout_seconds=30)
+    assert prefix not in sessions.stdout
+
+
+@pytest.mark.skipif(
+    not _live_enabled("COLAB_RUNNER_LIVE_SESSION_TEST"),
+    reason=(
+        "set COLAB_RUNNER_LIVE_SESSION_TEST=1 to allocate a reusable real "
+        "Colab CPU runtime"
+    ),
+)
+@pytest.mark.asyncio
+async def test_reusable_live_session_preserves_state_and_runs_selected_cell(
+    tmp_path: Path,
+) -> None:
+    setup_script = tmp_path / "state_setup.py"
+    setup_script.write_text("live_value = 40\n", encoding="utf-8")
+    notebook_path = tmp_path / "state_steps.ipynb"
+    notebook = nbformat.v4.new_notebook(
+        cells=[
+            nbformat.v4.new_markdown_cell("State check"),
+            nbformat.v4.new_code_cell(
+                "from pathlib import Path\n"
+                "result = live_value + 2\n"
+                "target = Path('/content/colab-runner-live/state.txt')\n"
+                "target.parent.mkdir(parents=True, exist_ok=True)\n"
+                "target.write_text(f'{result}\\n', encoding='utf-8')\n"
+                "print(f'COLAB_RUNNER_STATE={result}')\n",
+                id="state-check",
+            ),
+        ]
+    )
+    nbformat.write(notebook, notebook_path)
+
+    prefix = f"live-state-{uuid.uuid4().hex[:6]}"
+    artifact_dir = tmp_path / "artifacts"
+    log_path = tmp_path / "session.ipynb"
+    cli = ColabCli()
+    manager = ColabSessionManager(cli)
+    session_name: str | None = None
+    try:
+        started = await manager.start_session(
+            idle_timeout_seconds=300,
+            setup_timeout_seconds=600,
+            session_name_prefix=prefix,
+        )
+        assert started["ok"] is True, started
+        session_name = started["session_name"]
+
+        setup = await manager.execute(
+            session_name=session_name,
+            script_path=str(setup_script),
+            timeout_seconds=300,
+        )
+        assert setup["ok"] is True, setup
+
+        selected = await manager.execute(
+            session_name=session_name,
+            script_path=str(notebook_path),
+            cell_id="state-check",
+            timeout_seconds=300,
+        )
+        assert selected["ok"] is True, selected
+        assert "COLAB_RUNNER_STATE=42" in selected["execution"]["stdout"]
+
+        downloaded = await manager.download_artifact(
+            session_name=session_name,
+            remote_path="/content/colab-runner-live/state.txt",
+            artifact_dir=str(artifact_dir),
+        )
+        assert downloaded["ok"] is True, downloaded
+        assert Path(downloaded["local_path"]).read_text(encoding="utf-8") == "42\n"
+
+        exported = await manager.export_log(
+            session_name=session_name,
+            output_path=str(log_path),
+        )
+        assert exported["ok"] is True, exported
+        assert log_path.is_file()
+    finally:
+        if session_name is not None and manager.is_managed(session_name):
+            await manager.stop_session(session_name)
+        await manager.close()
 
     sessions = await cli.run(["sessions"], timeout_seconds=30)
     assert prefix not in sessions.stdout

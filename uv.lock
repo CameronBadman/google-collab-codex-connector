@@ -227,11 +227,12 @@ wheels = [
 
 [[package]]
 name = "codex-colab-runner"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
     { name = "google-colab-cli" },
+    { name = "nbformat" },
 ]
 
 [package.dev-dependencies]
@@ -244,6 +245,7 @@ dev = [
 requires-dist = [
     { name = "fastmcp", specifier = "==2.14.5" },
     { name = "google-colab-cli", specifier = "==0.6.0" },
+    { name = "nbformat", specifier = ">=5.10,<6" },
 ]
 
 [package.metadata.requires-dev]

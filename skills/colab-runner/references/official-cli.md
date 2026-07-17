@@ -71,6 +71,17 @@ colab --auth=adc stop -s NAME
 Supported accelerator values are T4, L4, G4, H100, A100, TPU v5e1, and TPU
 v6e1. Availability depends on the account and current Colab capacity.
 
+The official CLI associates each name with a remote runtime and kernel. Multiple
+`exec -s NAME` calls therefore share Python state until `stop -s NAME` releases
+the session. For `.py`, `exec` sends the file as one code block. For `.ipynb`,
+it parses the notebook locally and executes every code cell in order.
+
+The CLI does not expose cell-index selection. Colab Runner implements that
+agent-facing operation by parsing the local notebook with `nbformat`, extracting
+one code cell, and passing a temporary `.py` file to the same official `exec`
+command. It does not import private Colab CLI modules or alter the remote
+transport.
+
 ## Recovery
 
 - Authentication failure: refresh ADC with all four scopes above.
@@ -80,3 +91,6 @@ v6e1. Availability depends on the account and current Colab capacity.
   automatically.
 - Cleanup failure: call `colab_sessions`, inspect the generated session, and
   use `colab_stop_session` when it is still assigned.
+- Persistent-session execution timeout or cancellation: do not replay. Colab
+  Runner stops the leased session because the remote execution state is
+  ambiguous.

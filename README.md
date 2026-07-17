@@ -1,6 +1,7 @@
 # Colab Runner for Codex
 
-Colab Runner lets Codex execute bounded, observable workloads through
+Colab Runner lets Codex execute bounded, observable workloads or reuse a
+stateful kernel through
 [Google's official Colab CLI](https://github.com/googlecolab/google-colab-cli).
 It is a Codex plugin with a small MCP orchestration layer and an agent skill.
 
@@ -13,14 +14,15 @@ official primitives.
 ```text
 Codex
   └─ Colab Runner MCP tools
-       ├─ progress and hard deadline
-       ├─ fresh unique session
-       ├─ execute local .py or .ipynb
-       ├─ retrieve declared /content artifacts
-       ├─ export replayable notebook log
-       └─ always attempt colab stop
-            └─ official Google Colab CLI
-                 └─ Colab runtime
+       ├─ isolated job
+       │    └─ create → execute → collect → stop
+       ├─ reusable leased session
+       │    ├─ create → execute file/cell → execute again
+       │    ├─ preserve imports, variables, models, and GPU memory
+       │    ├─ retrieve /content artifacts and export a log
+       │    └─ explicit stop, idle expiry, or MCP shutdown
+       └─ official Google Colab CLI
+            └─ Colab runtime
 ```
 
 ## What it provides
@@ -31,9 +33,17 @@ Codex
 - CPU by default; GPU or TPU allocation must be selected explicitly.
 - A finite total deadline between 30 seconds and 24 hours.
 - Bounded subprocess output so a noisy workload cannot flood MCP transport.
+- Reusable named kernels for iterative work with a 10-minute default idle
+  lease.
+- Execution of one local notebook code cell by zero-based index or exact cell
+  ID without running the rest of the notebook.
+- Per-session execution serialization so multiple agents cannot concurrently
+  mutate one kernel.
 - Artifact downloads restricted to declared paths beneath `/content`.
 - A generated session name per job, avoiding collisions with existing sessions.
 - Cleanup in a `finally` path on success, failure, timeout, or interruption.
+- Automatic cleanup of leased sessions on idle expiry and normal MCP shutdown;
+  failed idle cleanup is retried.
 - No imports from private Colab CLI internals. Every operation crosses the
   official `colab` command boundary; the doctor additionally uses the pinned
   CLI's read-only `whoami` diagnostic.
@@ -115,9 +125,14 @@ the first workload.
 
 | Tool | Behavior |
 | --- | --- |
-| `colab_cli_doctor` | Checks the CLI, required ADC scopes, and read-only session access. |
-| `colab_sessions` | Lists active sessions without changing them. |
-| `colab_session_status` | Reads one named session's hardware and state. |
+| `colab_cli_doctor` | Checks the CLI, required credential scopes, and read-only session access. |
+| `colab_sessions` | Lists active sessions and connector-managed lease metadata. |
+| `colab_session_status` | Reads one session's hardware, state, and managed lease. |
+| `colab_start_session` | Allocates a reusable kernel with a bounded idle lease. |
+| `colab_execute` | Executes a `.py`, all code cells in an `.ipynb`, or one selected notebook code cell. |
+| `colab_renew_session` | Renews a lease and optionally changes its idle timeout. |
+| `colab_download_artifact` | Downloads one file beneath `/content` from a reusable session. |
+| `colab_export_log` | Exports a reusable session's execution history as `.ipynb`. |
 | `colab_run_job` | Provisions, executes, retrieves declared outputs, exports a log, and cleans up. |
 | `colab_stop_session` | Emergency release for a specifically named session. |
 
@@ -126,12 +141,55 @@ artifact directory, an optional accelerator, optional declared dependencies,
 optional remote files beneath `/content`, and a hard total deadline. It never
 leaves a session running intentionally.
 
+## Execution modes
+
+Use `colab_run_job` for isolated work. It provisions a fresh runtime and stops
+it before returning, including after failure, timeout, or cancellation. This is
+the lowest-risk option for a single training run, evaluation, conversion, or
+artifact build.
+
+Use a reusable session when multiple steps benefit from the same live Python
+kernel:
+
+1. Call `colab_start_session` with an accelerator and idle timeout.
+2. Call `colab_execute` repeatedly with local `.py` or `.ipynb` paths.
+3. For one notebook cell, pass either `cell_index` or `cell_id`. The index is
+   zero-based across all notebook cells, including markdown. The selected cell
+   must be a code cell.
+4. Retrieve required files with `colab_download_artifact` and optionally export
+   the full history with `colab_export_log`.
+5. Call `colab_stop_session` as soon as state is no longer needed.
+
+The connector extracts a selected cell locally with `nbformat`, sends only that
+cell's source through the official `colab exec` boundary, and deletes the
+temporary local file afterwards. Imports, variables, loaded models, files under
+`/content`, and GPU allocations from earlier calls remain in the same remote
+kernel.
+
+Reusable sessions reduce repeated provisioning, dependency installation,
+workload transmission, and setup output. That can reduce agent context usage
+and Colab startup overhead. They do not make idle GPU time free: an allocated
+runtime continues consuming account capacity while it waits. The default lease
+expires after 600 idle seconds, the accepted range is 60 to 21,600 seconds, and
+each execution, download, log export, or explicit renewal resets it. Execution
+is serialized per session. Execution timeout or cancellation releases the
+session because the remote execution state can no longer be proven safe.
+
 Example request to Codex:
 
 ```text
 Use Colab Runner to execute ./train.py on a T4 for at most 20 minutes.
 Install from requirements.txt, download /content/model.safetensors into
 ./artifacts, export the notebook log, and confirm the runtime was released.
+```
+
+Stateful example:
+
+```text
+Start a T4 Colab session with a 10-minute idle lease. Run ./load_model.py,
+then execute cell ID evaluate-batch in ./evaluation.ipynb on the same kernel.
+Download /content/results/metrics.json, export the session log, and stop the
+session.
 ```
 
 ## Development
@@ -156,6 +214,14 @@ Cancellation cleanup is a separate opt-in because it allocates another runtime:
 
 ```bash
 COLAB_RUNNER_LIVE_CANCEL_TEST=1 \
+  uv run pytest -q tests/test_live_colab.py
+```
+
+The reusable-session acceptance test verifies kernel state carry-over,
+selected-cell execution, artifact download, log export, and explicit release:
+
+```bash
+COLAB_RUNNER_LIVE_SESSION_TEST=1 \
   uv run pytest -q tests/test_live_colab.py
 ```
 

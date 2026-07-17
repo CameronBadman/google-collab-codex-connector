@@ -86,7 +86,7 @@ class ColabJobOrchestrator:
                 f"Provisioning {accelerator.replace('_', ' ')} Colab session",
             )
             await self.cli.run(
-                _new_arguments(session_name, accelerator),
+                new_session_arguments(session_name, accelerator),
                 timeout_seconds=_remaining(deadline),
             )
 
@@ -126,7 +126,7 @@ class ColabJobOrchestrator:
                     reporter,
                     f"Retrieving artifact {index}/{len(request['remote_artifacts'])}",
                 )
-                local_path = _artifact_local_path(
+                local_path = artifact_local_path(
                     request["artifact_dir"], remote_path
                 )
                 local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,7 +238,7 @@ class ColabJobOrchestrator:
             },
         }
         if execution_result is not None:
-            result["execution"] = _process_result_data(execution_result)
+            result["execution"] = process_result_data(execution_result)
 
         notebook_output = request["script_path"].with_name(
             f"{request['script_path'].stem}_output.ipynb"
@@ -257,32 +257,32 @@ def validate_session_name(session_name: str) -> str:
     return session_name
 
 
-def _validate_request(
-    *,
-    script_path: str,
-    accelerator: str,
-    packages: Sequence[str],
-    requirements_file: str | None,
-    remote_artifacts: Sequence[str],
-    artifact_dir: str | None,
-    export_log: bool,
-    max_runtime_seconds: float,
-    session_name_prefix: str,
-) -> dict[str, Any]:
-    script = Path(script_path).expanduser().resolve()
-    if not script.is_file() or script.suffix not in {".py", ".ipynb"}:
-        raise ValueError("script_path must be an existing .py or .ipynb file")
+def validate_accelerator(accelerator: str) -> str:
     if accelerator not in SUPPORTED_ACCELERATORS:
         supported = ", ".join(sorted(SUPPORTED_ACCELERATORS))
         raise ValueError(f"accelerator must be one of: {supported}")
-    if not 30 <= max_runtime_seconds <= 86_400:
-        raise ValueError("max_runtime_seconds must be between 30 and 86400")
+    return accelerator
 
-    normalized_prefix = re.sub(r"[^a-z0-9-]+", "-", session_name_prefix.lower())
-    normalized_prefix = normalized_prefix.strip("-")[:30]
-    if not normalized_prefix or not normalized_prefix[0].isalpha():
+
+def normalize_session_prefix(session_name_prefix: str) -> str:
+    normalized = re.sub(r"[^a-z0-9-]+", "-", session_name_prefix.lower())
+    normalized = normalized.strip("-")[:30]
+    if not normalized or not normalized[0].isalpha():
         raise ValueError("session_name_prefix must begin with a letter")
+    return normalized
 
+
+def validate_workload_path(script_path: str) -> Path:
+    script = Path(script_path).expanduser().resolve()
+    if not script.is_file() or script.suffix not in {".py", ".ipynb"}:
+        raise ValueError("script_path must be an existing .py or .ipynb file")
+    return script
+
+
+def validate_dependencies(
+    packages: Sequence[str],
+    requirements_file: str | None,
+) -> tuple[tuple[str, ...], Path | None]:
     package_values = tuple(packages)
     if len(package_values) > _PACKAGE_LIMIT:
         raise ValueError(f"at most {_PACKAGE_LIMIT} packages may be installed")
@@ -297,12 +297,36 @@ def _validate_request(
             raise ValueError("requirements_file must be an existing file")
     if requirements is not None and package_values:
         raise ValueError("use packages or requirements_file, not both")
+    return package_values, requirements
+
+
+def _validate_request(
+    *,
+    script_path: str,
+    accelerator: str,
+    packages: Sequence[str],
+    requirements_file: str | None,
+    remote_artifacts: Sequence[str],
+    artifact_dir: str | None,
+    export_log: bool,
+    max_runtime_seconds: float,
+    session_name_prefix: str,
+) -> dict[str, Any]:
+    script = validate_workload_path(script_path)
+    validate_accelerator(accelerator)
+    if not 30 <= max_runtime_seconds <= 86_400:
+        raise ValueError("max_runtime_seconds must be between 30 and 86400")
+
+    normalized_prefix = normalize_session_prefix(session_name_prefix)
+    package_values, requirements = validate_dependencies(
+        packages, requirements_file
+    )
 
     remote_values = tuple(remote_artifacts)
     if len(remote_values) > _ARTIFACT_LIMIT:
         raise ValueError(f"at most {_ARTIFACT_LIMIT} artifacts may be downloaded")
     for remote_path in remote_values:
-        _validate_remote_artifact(remote_path)
+        validate_remote_artifact(remote_path)
 
     destination: Path | None = None
     if artifact_dir is not None:
@@ -328,7 +352,7 @@ def _validate_request(
     }
 
 
-def _new_arguments(session_name: str, accelerator: str) -> list[str]:
+def new_session_arguments(session_name: str, accelerator: str) -> list[str]:
     arguments = ["new", "-s", session_name]
     if accelerator.startswith("TPU_"):
         arguments.extend(["--tpu", accelerator.removeprefix("TPU_").lower()])
@@ -337,7 +361,7 @@ def _new_arguments(session_name: str, accelerator: str) -> list[str]:
     return arguments
 
 
-def _validate_remote_artifact(remote_path: str) -> None:
+def validate_remote_artifact(remote_path: str) -> None:
     path = PurePosixPath(remote_path)
     relative_parts = remote_path.split("/")[2:]
     if (
@@ -351,7 +375,7 @@ def _validate_remote_artifact(remote_path: str) -> None:
         )
 
 
-def _artifact_local_path(destination: Path | None, remote_path: str) -> Path:
+def artifact_local_path(destination: Path | None, remote_path: str) -> Path:
     if destination is None:
         raise RuntimeError("artifact destination was not configured")
     relative = PurePosixPath(remote_path).relative_to("/content")
@@ -365,7 +389,7 @@ def _remaining(deadline: float) -> float:
     return min(remaining, 86_400)
 
 
-def _process_result_data(result: ProcessResult) -> dict[str, Any]:
+def process_result_data(result: ProcessResult) -> dict[str, Any]:
     return {
         "returncode": result.returncode,
         "stdout": result.stdout,

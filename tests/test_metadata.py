@@ -17,3 +17,4 @@ def test_release_metadata_stays_in_sync() -> None:
     assert __version__ == pyproject["project"]["version"] == plugin["version"]
     assert plugin["name"] == "colab-runner"
     assert "google-colab-cli==0.6.0" in pyproject["project"]["dependencies"]
+    assert "nbformat>=5.10,<6" in pyproject["project"]["dependencies"]

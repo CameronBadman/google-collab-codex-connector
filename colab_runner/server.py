@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastmcp import Context, FastMCP
@@ -7,6 +8,7 @@ from fastmcp import Context, FastMCP
 from .cli import ColabCli
 from .orchestrator import ColabJobOrchestrator, validate_session_name
 from .process import ProcessExecutionError, ProcessExecutionTimeout, ProcessResult
+from .sessions import ColabSessionManager
 
 
 Accelerator = Literal[
@@ -20,16 +22,31 @@ REQUIRED_COLAB_SCOPES = (
 )
 
 
-def create_mcp(cli: ColabCli | Any | None = None) -> FastMCP:
+def create_mcp(
+    cli: ColabCli | Any | None = None,
+    session_manager: ColabSessionManager | None = None,
+) -> FastMCP:
     official_cli = cli or ColabCli()
     jobs = ColabJobOrchestrator(official_cli)
+    managed_sessions = session_manager or ColabSessionManager(official_cli)
+
+    @asynccontextmanager
+    async def lifespan(_: FastMCP):
+        try:
+            yield
+        finally:
+            await managed_sessions.close()
+
     mcp = FastMCP(
         name="ColabRunner",
         instructions=(
             "Run safe, observable workloads through Google's official Colab CLI. "
-            "Use colab_cli_doctor before the first job. colab_run_job always "
-            "attempts to release its generated session before returning."
+            "Use colab_cli_doctor before the first allocation. Use colab_run_job "
+            "for isolated work, or a leased session for repeated stateful "
+            "execution. Stop leased sessions promptly; idle leases and server "
+            "shutdown trigger automatic cleanup."
         ),
+        lifespan=lifespan,
         mask_error_details=True,
     )
 
@@ -80,7 +97,11 @@ def create_mcp(cli: ColabCli | Any | None = None) -> FastMCP:
     async def colab_sessions(ctx: Context) -> dict[str, Any]:
         """List active official Colab CLI sessions without changing them."""
         await reporter(ctx)("Listing Colab sessions")
-        return await _safe_command(official_cli, ["sessions"], timeout_seconds=30)
+        result = await _safe_command(
+            official_cli, ["sessions"], timeout_seconds=30
+        )
+        result["managed_leases"] = managed_sessions.leases()
+        return result
 
     @mcp.tool()
     async def colab_session_status(
@@ -97,7 +118,93 @@ def create_mcp(cli: ColabCli | Any | None = None) -> FastMCP:
         result["found"] = result["ok"] and "not found" not in result.get(
             "stdout", ""
         ).lower()
+        result["managed_lease"] = managed_sessions.lease_status(session_name)
         return result
+
+    @mcp.tool()
+    async def colab_start_session(
+        ctx: Context,
+        accelerator: Accelerator = "CPU",
+        packages: Sequence[str] = (),
+        requirements_file: str | None = None,
+        idle_timeout_seconds: float = 600,
+        setup_timeout_seconds: float = 900,
+        session_name_prefix: str = "codex-live",
+    ) -> dict[str, Any]:
+        """Allocate a reusable Colab kernel protected by an idle lease."""
+        return await managed_sessions.start_session(
+            accelerator=accelerator,
+            packages=packages,
+            requirements_file=requirements_file,
+            idle_timeout_seconds=idle_timeout_seconds,
+            setup_timeout_seconds=setup_timeout_seconds,
+            session_name_prefix=session_name_prefix,
+            reporter=reporter(ctx),
+        )
+
+    @mcp.tool()
+    async def colab_execute(
+        session_name: str,
+        script_path: str,
+        ctx: Context,
+        cell_index: int | None = None,
+        cell_id: str | None = None,
+        timeout_seconds: float = 1800,
+    ) -> dict[str, Any]:
+        """Execute a file or selected notebook cell on a reusable session."""
+        return await managed_sessions.execute(
+            session_name=session_name,
+            script_path=script_path,
+            cell_index=cell_index,
+            cell_id=cell_id,
+            timeout_seconds=timeout_seconds,
+            reporter=reporter(ctx),
+        )
+
+    @mcp.tool()
+    async def colab_renew_session(
+        session_name: str,
+        ctx: Context,
+        idle_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Renew a reusable session lease, optionally changing its idle limit."""
+        await reporter(ctx)("Renewing reusable Colab session lease")
+        return await managed_sessions.renew_session(
+            session_name=session_name,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
+
+    @mcp.tool()
+    async def colab_download_artifact(
+        session_name: str,
+        remote_path: str,
+        artifact_dir: str,
+        ctx: Context,
+        timeout_seconds: float = 300,
+    ) -> dict[str, Any]:
+        """Download one declared /content file from a reusable session."""
+        return await managed_sessions.download_artifact(
+            session_name=session_name,
+            remote_path=remote_path,
+            artifact_dir=artifact_dir,
+            timeout_seconds=timeout_seconds,
+            reporter=reporter(ctx),
+        )
+
+    @mcp.tool()
+    async def colab_export_log(
+        session_name: str,
+        output_path: str,
+        ctx: Context,
+        timeout_seconds: float = 300,
+    ) -> dict[str, Any]:
+        """Export a reusable session's execution history as a notebook."""
+        return await managed_sessions.export_log(
+            session_name=session_name,
+            output_path=output_path,
+            timeout_seconds=timeout_seconds,
+            reporter=reporter(ctx),
+        )
 
     @mcp.tool()
     async def colab_run_job(
@@ -133,6 +240,8 @@ def create_mcp(cli: ColabCli | Any | None = None) -> FastMCP:
         """Explicitly stop and release a named Colab session."""
         validate_session_name(session_name)
         await reporter(ctx)("Stopping Colab session")
+        if managed_sessions.is_managed(session_name):
+            return await managed_sessions.stop_session(session_name)
         result = await _safe_command(
             official_cli,
             ["stop", "-s", session_name],
