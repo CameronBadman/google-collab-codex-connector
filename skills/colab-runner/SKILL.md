@@ -1,6 +1,6 @@
 ---
 name: colab-runner
-description: Run isolated workloads or reusable leased Python kernels on Google Colab through Google's official CLI with bounded execution, selected notebook-cell execution, live status, artifact retrieval, replayable logs, and automatic runtime cleanup. Use when Codex should offload Python or ML work to Colab CPU, GPU, or TPU; preserve state across several execution steps; inspect active sessions; retrieve outputs from /content; or release compute.
+description: Run isolated workloads or reusable leased Python kernels on Google Colab through Google's official CLI with guarded local notebook-cell edits, background selected-cell execution, bounded status, artifact retrieval, replayable logs, and automatic runtime cleanup. Use when Codex should offload Python or ML work to Colab CPU, GPU, or TPU; preserve state across several execution steps; inspect or edit local notebook cells; retrieve outputs from /content; or release compute.
 ---
 
 # Colab Runner
@@ -46,6 +46,22 @@ clean up generated or leased sessions.
    Confirm its result or inspect `colab_sessions`; do not wait for idle expiry
    as the normal cleanup path.
 
+## Managed notebook cells
+
+1. Treat the local `.ipynb` as the source of truth and the leased Colab resource
+   as a stateful Python kernel.
+2. Call `colab_notebook_cells` before editing. Retain the target cell ID or
+   index and its `source_sha256`.
+3. Pass that hash as `expected_source_sha256` to
+   `colab_update_notebook_cell`. On conflict, inspect again; do not overwrite
+   the newer source.
+4. For long work, call `colab_execute` with a selected cell and
+   `background=true`. Poll the returned ID with `colab_cell_status`.
+5. Use `write_output_to_notebook=true` only when local output persistence is
+   useful. A source-hash conflict prevents stale output from being written.
+6. Never infer completion from an empty status response. Require a terminal
+   execution state.
+
 ## Safety
 
 - Keep `max_runtime_seconds` finite and proportional to the task.
@@ -69,8 +85,11 @@ clean up generated or leased sessions.
 - `colab_sessions`: read-only inventory of assigned sessions.
 - `colab_session_status`: read-only inspection of one session.
 - `colab_start_session`: reusable kernel with an automatic idle lease.
+- `colab_notebook_cells`: bounded local cell inspection and source identities.
+- `colab_update_notebook_cell`: guarded atomic local cell update.
 - `colab_execute`: whole local workload or one selected notebook code cell on a
-  connector-managed session.
+  connector-managed session; selected cells support background mode.
+- `colab_cell_status`: bounded state and output for a selected-cell execution.
 - `colab_renew_session`: intentional lease extension.
 - `colab_download_artifact`: one file beneath `/content` from a leased session.
 - `colab_export_log`: replayable notebook history for a leased session.

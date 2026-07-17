@@ -17,8 +17,9 @@ Codex
        ├─ isolated job
        │    └─ create → execute → collect → stop
        ├─ reusable leased session
-       │    ├─ create → execute file/cell → execute again
+       │    ├─ create → inspect/edit/execute cell → poll → execute again
        │    ├─ preserve imports, variables, models, and GPU memory
+       │    ├─ track bounded per-cell execution state and output
        │    ├─ retrieve /content artifacts and export a log
        │    └─ explicit stop, idle expiry, or MCP shutdown
        └─ official Google Colab CLI
@@ -37,6 +38,14 @@ Codex
   lease.
 - Execution of one local notebook code cell by zero-based index or exact cell
   ID without running the rest of the notebook.
+- Paginated notebook-cell inspection with bounded source excerpts and stable
+  SHA-256 identities.
+- Atomic cell edits with optimistic concurrency, preventing an agent from
+  overwriting source that changed after inspection.
+- Background selected-cell execution with a stable execution ID, bounded
+  status responses, and explicit queued, running, and terminal states.
+- Optional output write-back to the local notebook. Output is written only when
+  the cell source still matches the exact source that ran.
 - Per-session execution serialization so multiple agents cannot concurrently
   mutate one kernel.
 - Artifact downloads restricted to declared paths beneath `/content`.
@@ -129,7 +138,10 @@ the first workload.
 | `colab_sessions` | Lists active sessions and connector-managed lease metadata. |
 | `colab_session_status` | Reads one session's hardware, state, and managed lease. |
 | `colab_start_session` | Allocates a reusable kernel with a bounded idle lease. |
-| `colab_execute` | Executes a `.py`, all code cells in an `.ipynb`, or one selected notebook code cell. |
+| `colab_notebook_cells` | Reads a bounded page of local cell metadata, source hashes, optional source excerpts, and latest execution state. |
+| `colab_update_notebook_cell` | Atomically changes one local cell when its expected source hash still matches. |
+| `colab_execute` | Executes a `.py`, all code cells in an `.ipynb`, or one selected cell; selected cells can run in the background and write output back safely. |
+| `colab_cell_status` | Reads queued/running/terminal state and bounded output for one selected-cell execution ID. |
 | `colab_renew_session` | Renews a lease and optionally changes its idle timeout. |
 | `colab_download_artifact` | Downloads one file beneath `/content` from a reusable session. |
 | `colab_export_log` | Exports a reusable session's execution history as `.ipynb`. |
@@ -152,19 +164,39 @@ Use a reusable session when multiple steps benefit from the same live Python
 kernel:
 
 1. Call `colab_start_session` with an accelerator and idle timeout.
-2. Call `colab_execute` repeatedly with local `.py` or `.ipynb` paths.
-3. For one notebook cell, pass either `cell_index` or `cell_id`. The index is
-   zero-based across all notebook cells, including markdown. The selected cell
-   must be a code cell.
-4. Retrieve required files with `colab_download_artifact` and optionally export
+2. Use `colab_notebook_cells` to inspect cell IDs, indexes, and source hashes.
+3. When changing a cell, pass the inspected hash to
+   `colab_update_notebook_cell`. A conflict means the notebook changed and must
+   be inspected again.
+4. Call `colab_execute` repeatedly with local `.py` or `.ipynb` paths. For one
+   notebook cell, pass either `cell_index` or `cell_id`. The index is zero-based
+   across all notebook cells, including markdown.
+5. For a long selected cell, set `background=true`, retain the returned
+   `execution_id`, and poll `colab_cell_status`. Set
+   `write_output_to_notebook=true` only when the local notebook should receive
+   the bounded stdout and stderr.
+6. Retrieve required files with `colab_download_artifact` and optionally export
    the full history with `colab_export_log`.
-5. Call `colab_stop_session` as soon as state is no longer needed.
+7. Call `colab_stop_session` as soon as state is no longer needed.
 
-The connector extracts a selected cell locally with `nbformat`, sends only that
-cell's source through the official `colab exec` boundary, and deletes the
-temporary local file afterwards. Imports, variables, loaded models, files under
+The leased Colab resource is a stateful Python kernel, not a remotely editable
+copy of the local notebook. The local `.ipynb` remains the managed document and
+source of truth. The connector extracts the selected source with `nbformat`,
+sends only that source through the official `colab exec` boundary, and deletes
+the temporary file afterwards. Imports, variables, loaded models, files under
 `/content`, and GPU allocations from earlier calls remain in the same remote
 kernel.
+
+Each selected execution captures the cell's source hash. Optional output
+write-back performs a second hash check under the notebook's local write lock.
+If an agent or editor changed the cell while it ran, execution still completes,
+but the old output is reported as a conflict and is not written over the newer
+cell. Background mode is intentionally limited to a selected cell; whole-file
+execution remains a blocking operation with one definitive result.
+
+Cell execution records are process-local and bounded to the latest 512
+terminal records by default. Restarting the MCP server clears status history and
+stops connector-managed leased sessions through the normal shutdown path.
 
 Reusable sessions reduce repeated provisioning, dependency installation,
 workload transmission, and setup output. That can reduce agent context usage
@@ -190,6 +222,15 @@ Start a T4 Colab session with a 10-minute idle lease. Run ./load_model.py,
 then execute cell ID evaluate-batch in ./evaluation.ipynb on the same kernel.
 Download /content/results/metrics.json, export the session log, and stop the
 session.
+```
+
+Managed-cell example:
+
+```text
+Start a T4 session, inspect ./evaluation.ipynb, and update cell ID
+evaluate-batch using its current source hash. Run that cell in the background,
+write its bounded output back to the notebook if the source is unchanged, poll
+until terminal, then stop the session.
 ```
 
 ## Development
@@ -218,7 +259,8 @@ COLAB_RUNNER_LIVE_CANCEL_TEST=1 \
 ```
 
 The reusable-session acceptance test verifies kernel state carry-over,
-selected-cell execution, artifact download, log export, and explicit release:
+background selected-cell execution, bounded status, guarded local output
+write-back, artifact download, log export, and explicit release:
 
 ```bash
 COLAB_RUNNER_LIVE_SESSION_TEST=1 \

@@ -1,4 +1,4 @@
 interface:
   display_name: "Colab Runner"
-  short_description: "Run safe Colab jobs or reusable leased kernels"
-  default_prompt: "Use $colab-runner to run this workload safely, reusing a leased Colab kernel only when persistent state is beneficial."
+  short_description: "Manage notebook cells on leased Colab kernels"
+  default_prompt: "Use $colab-runner to inspect and safely execute this workload, reusing a leased Colab kernel only when persistent state is beneficial."

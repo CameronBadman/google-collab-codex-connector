@@ -1,7 +1,7 @@
 {
   "name": "colab-runner",
-  "version": "0.2.0",
-  "description": "Run isolated jobs or reusable leased sessions on Google Colab through the official CLI.",
+  "version": "0.3.0",
+  "description": "Manage local notebook cells and run them on leased Google Colab kernels through the official CLI.",
   "author": {
     "name": "Cameron Badman",
     "url": "https://github.com/CameronBadman"
@@ -14,14 +14,15 @@
   "interface": {
     "displayName": "Colab Runner",
     "shortDescription": "Safe Colab jobs and leased sessions from Codex",
-    "longDescription": "Run isolated workloads or reuse a leased Google Colab kernel through the official CLI, execute selected notebook cells, retrieve declared artifacts, export replayable logs, and automatically release idle sessions.",
+    "longDescription": "Inspect and safely edit local notebook cells, execute them on a leased Google Colab kernel through the official CLI, poll bounded background status, retrieve declared artifacts, export replayable logs, and automatically release idle sessions.",
     "developerName": "Cameron Badman",
     "category": "Developer Tools",
-    "capabilities": ["Execute", "Monitor", "Artifacts", "Persistent Sessions"],
+    "capabilities": ["Notebook Cells", "Execute", "Monitor", "Artifacts", "Persistent Sessions"],
     "websiteURL": "https://github.com/CameronBadman/google-collab-codex-connector",
     "defaultPrompt": [
       "Run this Python workload safely on Colab and retrieve its artifacts.",
       "Keep a Colab kernel alive while I execute selected notebook cells.",
+      "Inspect, update, and run one notebook cell without rerunning the notebook.",
       "Check my active Colab sessions and report anything still consuming compute.",
       "Execute this notebook on a T4 with a hard deadline and export the run log."
     ]

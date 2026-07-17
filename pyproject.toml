@@ -1,7 +1,7 @@
 [project]
 name = "codex-colab-runner"
-version = "0.2.0"
-description = "Safe, observable Google Colab CLI workloads for Codex"
+version = "0.3.0"
+description = "Managed notebook cells and safe Google Colab workloads for Codex"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
